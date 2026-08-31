@@ -1,0 +1,45 @@
+# kaoyan2026 云端出卷执行器 workflow（2026-08-24）
+# 触发：本地工具通过 workflow_dispatch 派发（inputs.gist_id = 任务 Gist id）
+# 所需 repo secrets（仓库 Settings → Secrets and variables → Actions）：
+#   CLOUDJOB_GH_TOKEN     GitHub 令牌（需 gist 权限，用于读写任务 Gist）—— 必配
+#   CLOUDJOB_AI_ENDPOINT / CLOUDJOB_AI_KEY / CLOUDJOB_AI_MODEL —— 可选回退：
+#     本地工具提交任务时会把 AI 配置自动写进 job.json（存于用户本人 secret Gist，
+#     执行器优先读取；仅当任务未自带时才用这三个 secrets）。
+name: AI Exam Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      gist_id:
+        description: 'CloudJob Gist ID'
+        required: true
+
+jobs:
+  run-exam:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python (AI 验算工具)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install sympy
+        run: pip install sympy
+
+      - name: Run cloud exam job
+        env:
+          GIST_ID: ${{ github.event.inputs.gist_id }}
+          GH_TOKEN: ${{ secrets.CLOUDJOB_GH_TOKEN }}
+          AI_ENDPOINT: ${{ secrets.CLOUDJOB_AI_ENDPOINT }}
+          AI_KEY: ${{ secrets.CLOUDJOB_AI_KEY }}
+          AI_MODEL: ${{ secrets.CLOUDJOB_AI_MODEL }}
+        run: node tools/cloud/ai-exam-runner.cjs
