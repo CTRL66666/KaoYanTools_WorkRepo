@@ -17,7 +17,10 @@ on:
 jobs:
   run-exam:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 【2026-09-01】45 → 90：慢模型出强化卷（35+ 题）本就可能跑 40 分钟+，
+    # 叠加 API 限额退避（v9 起最长等 30 分钟）后 45 分钟必死。超时被杀时
+    # runner 已有 SIGTERM 终态回写（不再留「冻结在半路」的假运行状态）。
+    timeout-minutes: 90
     steps:
       - name: Checkout runner
         uses: actions/checkout@v4
