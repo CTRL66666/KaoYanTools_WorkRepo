@@ -41,6 +41,9 @@ const { URL } = require('url');
 const API = 'https://api.github.com';
 const GIST_ID = process.env.GIST_ID || '';
 const GH_TOKEN = process.env.GH_TOKEN || '';
+// 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
+// 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
+const RUNNER_VER = 'v9';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -151,7 +154,7 @@ function pushLog(msg, level, dur) {
 // 失败时把完整日志单独写一份（不受 status.json 覆写失败影响）
 async function writeLogFile(extra, jobId) {
   try {
-    const payload = { runnerVer: 'v9', jobId: jobId || '', at: new Date().toISOString(), error: extra || null, entries: RUN_LOG };
+    const payload = { runnerVer: RUNNER_VER, jobId: jobId || '', at: new Date().toISOString(), error: extra || null, entries: RUN_LOG };
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: { 'log.json': { content: JSON.stringify(payload) } } }, 2);
     log('📜 已落盘 log.json（' + RUN_LOG.length + ' 条）');
   } catch (e) { log('!! log.json 落盘失败（不影响主流程）：', e.message); }
@@ -225,7 +228,7 @@ async function _setStatus(status, stage, msg, progress) {
   pushLog((stage ? '[' + stage + '] ' : '') + (msg || ''));
   // savedCount = 已成功落盘到 partial.json 的题数（= 客户端随时能抢救走的数量），
   // 让本地无需额外拉 Gist 就知道「现在有几题可抢救」，任务行可直接显示入口。
-  const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) } } };
+  const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) } } };
   try { await ghRetry('PATCH', '/gists/' + GIST_ID, payload); log('status →', status, stage || '', msg || ''); return true; }
   catch (e) {
     const hint = (e && e.status === 404)
@@ -606,7 +609,7 @@ async function handleTermination(sig) {
   log('!! 收到 ' + sig + '：执行器将被终止（Actions 超时或手动取消），尽力回写终态…');
   // 被杀的宽限期只有几秒：直写不走 ghRetry（限额长退避会白等几分钟，等来 SIGKILL）
   const payload = { files: {
-    'status.json': { content: JSON.stringify({ status: 'error', stage: '', msg: '⚠ 执行器被强制终止（' + sig + '：Actions 超时或手动取消）· 已出 ' + _partialCount + ' 题已落盘 partial.json，可点「🆘 抢救已出题目」收卷', progress: null, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) }
+    'status.json': { content: JSON.stringify({ status: 'error', stage: '', msg: '⚠ 执行器被强制终止（' + sig + '：Actions 超时或手动取消）· 已出 ' + _partialCount + ' 题已落盘 partial.json，可点「🆘 抢救已出题目」收卷', progress: null, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
   } };
   for (let i = 0; i < 2; i++) {
     try { await ghReq('PATCH', '/gists/' + GIST_ID, payload); log('✅ 终态已回写'); break; }
@@ -680,7 +683,7 @@ process.on('SIGINT', () => handleTermination('SIGINT'));
       const aiOk = !!(aiConf('endpoint') && aiConf('key') && aiConf('model'));
       await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
         'result.json': { content: JSON.stringify({ cloudJobCheck: true, ok: true, aiConfigPresent: aiOk, checkedAt: new Date().toISOString() }) },
-        'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '🧪 自检通过：Gist 读写 ✓ · CLOUDJOB_GH_TOKEN ✓ · AI 配置在场' + (aiOk ? ' ✓' : ' ✗'), progress: 100, updatedAt: new Date().toISOString(), runnerVer: 'v1' }) }
+        'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '🧪 自检通过：Gist 读写 ✓ · CLOUDJOB_GH_TOKEN ✓ · AI 配置在场' + (aiOk ? ' ✓' : ' ✗'), progress: 100, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
       } });
       log('🧪 自检完成');
       return;
@@ -877,7 +880,7 @@ process.on('SIGINT', () => handleTermination('SIGINT'));
     await flushPartial(questions, { reviewed: true, subject: subj });
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
       'result.json': { content: JSON.stringify(exam) },
-      'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) }
+      'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
     } });
     log('✅ 完成');
   } catch (e) {
@@ -902,7 +905,7 @@ process.on('SIGINT', () => handleTermination('SIGINT'));
           };
           await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
             'result.json': { content: JSON.stringify(partial) },
-            'status.json': { content: JSON.stringify({ status: 'canceled', stage: '', msg: '⏹ 已停止 · 已保存 ' + cands.length + ' 题（可收卷导入部分卷）', progress: 100, partialSaved: true, partialCount: cands.length, savedCount: _partialCount, log: RUN_LOG, qs: QS, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) }
+            'status.json': { content: JSON.stringify({ status: 'canceled', stage: '', msg: '⏹ 已停止 · 已保存 ' + cands.length + ' 题（可收卷导入部分卷）', progress: 100, partialSaved: true, partialCount: cands.length, savedCount: _partialCount, log: RUN_LOG, qs: QS, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
           } });
           log('⏹ 已停止并保存', cands.length, '题');
         } else {
