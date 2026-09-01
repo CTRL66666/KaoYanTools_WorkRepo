@@ -84,7 +84,22 @@ function ghReq(method, path, body) {
         if (res.statusCode === 204) return resolve(null);
         let d = null;
         try { d = txt ? JSON.parse(txt) : null; } catch (e) {}
-        if (res.statusCode >= 400) { const e = new Error('GitHub HTTP ' + res.statusCode + ' ' + txt.slice(0, 200)); e.status = res.statusCode; return reject(e); }
+        if (res.statusCode >= 400) {
+          const e = new Error('GitHub HTTP ' + res.statusCode + ' ' + txt.slice(0, 200));
+          e.status = res.statusCode;
+          // 【2026-09-01 限额长退避】403/429 必须区分「限额」与「权限」：限额是暂时的
+          //（窗口最长 60 分钟），权限错误是永久的。靠响应头识别，把 reset 时刻带给
+          // ghRetry 安排真正的等待，而不是 2~8s 后放弃（那正是「进度冻结一小时」的元凶）。
+          const rem = res.headers && res.headers['x-ratelimit-remaining'];
+          const rst = res.headers && res.headers['x-ratelimit-reset'];
+          if (res.statusCode === 429 || String(rem) === '0') {
+            e.rateLimited = true;
+            if (rst) e.rateReset = Number(rst) * 1000;
+            const ra = res.headers && res.headers['retry-after'];
+            if (ra) e.retryAfterMs = Number(ra) * 1000;
+          }
+          return reject(e);
+        }
         resolve(d);
       });
     });
@@ -94,10 +109,26 @@ function ghReq(method, path, body) {
     req.end();
   });
 }
+// 【2026-09-01 限额长退避】限额等待总预算：本地轮询 + 执行器回写共用同一个 PAT，
+// 5000 次/时烧穿后，等窗口重置（最长 60 分钟）是唯一出路。预算 30 分钟封顶，
+// 防止无限等把 Actions 时长烧光；预算耗尽才真正放弃（写 error 终态）。
+let _rlWaitBudgetMs = 30 * 60 * 1000;
 async function ghRetry(method, path, body, tries = 4) {
   for (let i = 0; ; i++) {
     try { return await ghReq(method, path, body); }
     catch (e) {
+      if (e.rateLimited) {
+        // 等到 reset 时刻（+3s 余量），单次最长 5 分钟、且不得超过剩余预算
+        let waitMs = e.retryAfterMs || (e.rateReset ? Math.max(0, e.rateReset - Date.now() + 3000) : 60000);
+        waitMs = Math.min(waitMs, 300000, _rlWaitBudgetMs);
+        if (waitMs <= 0) throw new Error('GitHub API 限额持续未恢复（已累计等待 30 分钟），本次任务放弃回写：' + e.message);
+        _rlWaitBudgetMs -= waitMs;
+        log('⏸ GitHub API 限额，退避 ' + Math.round(waitMs / 1000) + 's 后重试（等待预算剩 ' + Math.round(_rlWaitBudgetMs / 60000) + ' 分钟）');
+        pushLog('⏸ GitHub API 限额耗尽：退避 ' + Math.round(waitMs / 1000) + 's 后继续（出题不中断，进度回写延后）', 'warn');
+        await sleep(waitMs);
+        i = -1;   // 限额等待不计入普通重试次数
+        continue;
+      }
       if (i >= tries - 1 || (e.status && e.status < 500 && e.status !== 403)) throw e;
       log('GitHub 请求失败重试', i + 1, e.message);
       await sleep(2000 * (i + 1));
@@ -120,7 +151,7 @@ function pushLog(msg, level, dur) {
 // 失败时把完整日志单独写一份（不受 status.json 覆写失败影响）
 async function writeLogFile(extra, jobId) {
   try {
-    const payload = { runnerVer: 'v8', jobId: jobId || '', at: new Date().toISOString(), error: extra || null, entries: RUN_LOG };
+    const payload = { runnerVer: 'v9', jobId: jobId || '', at: new Date().toISOString(), error: extra || null, entries: RUN_LOG };
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: { 'log.json': { content: JSON.stringify(payload) } } }, 2);
     log('📜 已落盘 log.json（' + RUN_LOG.length + ' 条）');
   } catch (e) { log('!! log.json 落盘失败（不影响主流程）：', e.message); }
@@ -194,7 +225,7 @@ async function _setStatus(status, stage, msg, progress) {
   pushLog((stage ? '[' + stage + '] ' : '') + (msg || ''));
   // savedCount = 已成功落盘到 partial.json 的题数（= 客户端随时能抢救走的数量），
   // 让本地无需额外拉 Gist 就知道「现在有几题可抢救」，任务行可直接显示入口。
-  const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v8' }) } } };
+  const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) } } };
   try { await ghRetry('PATCH', '/gists/' + GIST_ID, payload); log('status →', status, stage || '', msg || ''); return true; }
   catch (e) {
     const hint = (e && e.status === 404)
@@ -405,9 +436,17 @@ async function aiToolJson(messages, opts, maxRounds) {
 // 为什么不能把 canceled 写进 status.json：setStatus 每一轮都会 PATCH 覆盖 status.json，
 // 前端写进去的 canceled 会被下一轮 running 覆盖冲掉 → 取消信号丢失。独立 cancel.json 不被覆盖。
 let _cancelCache = null;
+let _cancelCheckedAt = 0;   // 上次真实探测时刻（20s 节流）
 class CancelError extends Error { constructor(m) { super(m); this.name = 'CancelError'; } }
+/* 【2026-09-01 取消探测节流】出题池每取一题前后都查取消信号，且 cancel.json 在用户
+ * 取消前根本不存在 → _cancelCache 永远是 null → 每次探测都是真实 GET（全量 gist，
+ * 随 partial.json 增长越来越大）。35 题的卷子光取消探测就烧 ~100 次配额。
+ * 节流到 20s 一次：取消延迟 ≤20s + 题边界，用户无感；配额省下一个数量级。
+ * 已取消则永久缓存（取消不可逆）；阶段边界 cancelCheckpoint(force) 不受节流约束。 */
 async function checkCancel(force) {
-  if (_cancelCache && !force) return _cancelCache;
+  if (_cancelCache && _cancelCache.canceled) return _cancelCache;
+  if (!force && Date.now() - _cancelCheckedAt < 20000) return _cancelCache;
+  _cancelCheckedAt = Date.now();
   try {
     const g = await ghRetry('GET', '/gists/' + GIST_ID);
     const f = g && g.files && g.files['cancel.json'];
@@ -554,6 +593,29 @@ function braceBalanced(s) {
   }
   return n === 0;
 }
+
+// ---------- 终止信号处理（2026-09-01「进度静止一小时不动」的另一半元凶） ----------
+// Actions 超时（timeout-minutes）或手动取消工作流时，runner 进程收到 SIGTERM 直接被杀，
+// status.json 永远停在最后一次成功回写——本地侧无限轮询一个死任务，表现为
+// 「进度/日志冻结，一小时回来还是静止」。终止前尽力写一条 error 终态（带原因 +
+// 可抢救题数），让本地立刻知道任务已死、该去抢救 partial.json，而不是干等。
+let _sigHandled = false;
+async function handleTermination(sig) {
+  if (_sigHandled) return;
+  _sigHandled = true;
+  log('!! 收到 ' + sig + '：执行器将被终止（Actions 超时或手动取消），尽力回写终态…');
+  // 被杀的宽限期只有几秒：直写不走 ghRetry（限额长退避会白等几分钟，等来 SIGKILL）
+  const payload = { files: {
+    'status.json': { content: JSON.stringify({ status: 'error', stage: '', msg: '⚠ 执行器被强制终止（' + sig + '：Actions 超时或手动取消）· 已出 ' + _partialCount + ' 题已落盘 partial.json，可点「🆘 抢救已出题目」收卷', progress: null, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) }
+  } };
+  for (let i = 0; i < 2; i++) {
+    try { await ghReq('PATCH', '/gists/' + GIST_ID, payload); log('✅ 终态已回写'); break; }
+    catch (e) { log('!! 终态回写失败（第 ' + (i + 1) + ' 次）：', e.message); await sleep(1500); }
+  }
+  process.exit(1);
+}
+process.on('SIGTERM', () => handleTermination('SIGTERM'));
+process.on('SIGINT', () => handleTermination('SIGINT'));
 
 // ---------- 主流程 ----------
 (async function main() {
@@ -815,7 +877,7 @@ function braceBalanced(s) {
     await flushPartial(questions, { reviewed: true, subject: subj });
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
       'result.json': { content: JSON.stringify(exam) },
-      'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v8' }) }
+      'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) }
     } });
     log('✅ 完成');
   } catch (e) {
@@ -840,7 +902,7 @@ function braceBalanced(s) {
           };
           await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
             'result.json': { content: JSON.stringify(partial) },
-            'status.json': { content: JSON.stringify({ status: 'canceled', stage: '', msg: '⏹ 已停止 · 已保存 ' + cands.length + ' 题（可收卷导入部分卷）', progress: 100, partialSaved: true, partialCount: cands.length, savedCount: _partialCount, log: RUN_LOG, qs: QS, updatedAt: new Date().toISOString(), runnerVer: 'v8' }) }
+            'status.json': { content: JSON.stringify({ status: 'canceled', stage: '', msg: '⏹ 已停止 · 已保存 ' + cands.length + ' 题（可收卷导入部分卷）', progress: 100, partialSaved: true, partialCount: cands.length, savedCount: _partialCount, log: RUN_LOG, qs: QS, updatedAt: new Date().toISOString(), runnerVer: 'v9' }) }
           } });
           log('⏹ 已停止并保存', cands.length, '题');
         } else {
