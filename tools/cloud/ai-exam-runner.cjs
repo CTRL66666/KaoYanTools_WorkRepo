@@ -43,14 +43,37 @@ const GIST_ID = process.env.GIST_ID || '';
 const SOURCE_GIST_ID = process.env.SOURCE_GIST_ID || '';   // 【v11】PDF 导入时源文件所在独立 Gist（任务 Gist 截断时绕路用）
 const GH_TOKEN = process.env.GH_TOKEN || '';
 /* 【2026-09-02 PDF 导入】通用 shell 执行（poppler 工具链：pdfinfo/pdftotext/pdftoppm）。
- * Actions runner 自带 poppler-utils，零安装。参数一律 JSON.stringify 引号化防注入；
- * 只允许跑本机二进制，不接收任何来自 Gist/AI 的命令文本。 */
+ * 参数一律 JSON.stringify 引号化防注入；只允许跑本机二进制，不接收任何来自 Gist/AI 的命令文本。
+ * ⚠️ poppler 在 ubuntu-latest 上**并未预装**（2026-09-02 真机踩坑），由 ensurePoppler 负责探测+自救。 */
 function runShell(cmd, timeoutMs, maxBuffer) {
   return new Promise((resolve) => {
     cpExec(cmd, { timeout: timeoutMs || 60000, maxBuffer: maxBuffer || 8 * 1024 * 1024, cwd: process.cwd(),
       env: { PATH: process.env.PATH || '', HOME: process.env.HOME || '', LANG: 'C.UTF-8' } },
       (err, stdout, stderr) => resolve({ ok: !err, out: String(stdout || ''), err: err ? (String(stderr || '').slice(0, 400) || err.message) : '' }));
   });
+}
+/* 【v11 poppler 可用性】踩坑实证（2026-09-02）：GitHub Actions 的 ubuntu-latest
+ * **并不预装** poppler-utils（此前假设「自带」是错的，真机实测 pdfinfo: not found）。
+ * 三道防线：① 开跑前探测；② 缺失则运行时自救（Actions runner 有免密 sudo，装一次约 10~20s）
+ * ——即使用户仓库里的 workflow 还是旧版（不含安装步骤），导入任务也能自己救回来；
+ * ③ 装不上时给出「点一键安装升级 workflow」的明确出路，绝不再把环境缺失误报成文件损坏。 */
+let POPPLER_READY = false;
+async function ensurePoppler() {
+  if (POPPLER_READY) return true;
+  const probe = await runShell('command -v pdfinfo; command -v pdftotext; command -v pdftoppm', 20000);
+  const out = String(probe.out || '');
+  if (out.indexOf('pdfinfo') >= 0 && out.indexOf('pdftotext') >= 0 && out.indexOf('pdftoppm') >= 0) {
+    POPPLER_READY = true;
+    return true;
+  }
+  pushLog('⚙️ poppler-utils 缺失，尝试自动安装…', 'warn');
+  const inst = await runShell('sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils', 240000);
+  const probe2 = await runShell('command -v pdfinfo; command -v pdftotext; command -v pdftoppm', 20000);
+  const out2 = String(probe2.out || '');
+  POPPLER_READY = !!(out2.indexOf('pdfinfo') >= 0 && out2.indexOf('pdftotext') >= 0 && out2.indexOf('pdftoppm') >= 0);
+  if (POPPLER_READY) pushLog('✅ poppler-utils 已自动安装就绪（pdfinfo/pdftotext/pdftoppm 齐备）');
+  else pushLog('⚠️ poppler-utils 自动安装失败：' + String(inst.err || '').slice(0, 120), 'warn');
+  return POPPLER_READY;
 }
 /* gist 大文件（>1MB 会被 API 响应截断）：抓 raw_url。secret gist 的 raw 匿名 404，
  * 必须带 GH_TOKEN；返回 Buffer（PDF/base64 都可能非 UTF-8 安全）。 */
@@ -797,8 +820,16 @@ async function runImport(gist, job, prefs) {
     } else {
       const pdfPath = pathT.join(wd, 'src.pdf');
       fsT.writeFileSync(pdfPath, buf);
+      await ensurePoppler();   // 【v11】poppler 可能没预装 → 探测 + 缺失时自动 apt 安装
       const vi = await runShell('pdfinfo ' + JSON.stringify(pdfPath), 30000);
-      if (!vi.ok) throw new Error('PDF 解析失败（文件损坏或加密受保护）：' + String(vi.err).slice(0, 200));
+      if (!vi.ok) {
+        // 错误信息纠偏：工具缺失 ≠ 文件损坏。旧版把 not found 也报成「文件损坏/加密」，
+        // 用户会一直去换 PDF，而真正要做的是升级 workflow（或等 runner 自救失败后的明确指引）。
+        if (/not found|No such file|command not found/i.test(String(vi.err))) {
+          throw new Error('执行器环境缺少 poppler-utils（pdfinfo/pdftotext/pdftoppm 都不可用，自动安装也失败）——请到「🛠 配置向导」点一次「🚀 一键安装」升级 workflow（新版 workflow 自带安装步骤）');
+        }
+        throw new Error('PDF 解析失败（文件损坏或加密受保护）：' + String(vi.err).slice(0, 200));
+      }
       const pm = vi.out.match(/^Pages:\s+(\d+)/m);
       const pages = pm ? parseInt(pm[1], 10) : 0;
       if (!pages) throw new Error('PDF 页数为 0');
