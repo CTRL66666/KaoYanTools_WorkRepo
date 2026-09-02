@@ -46,6 +46,16 @@ jobs:
       - name: Install sympy
         run: pip install sympy
 
+      # 【v11 PDF 导入】poppler-utils（pdfinfo / pdftotext / pdftoppm）——解析试卷必需的三个命令行工具。
+      # 踩坑实证（2026-09-02）：ubuntu-latest **并未预装** poppler-utils，缺它时导入任务会在
+      # 「已拉到源文件之后」直接崩 pdfinfo: not found。这里显式安装（约 10~20s，Actions runner 有免密 sudo）。
+      # runner 侧另有运行时自救（检测到 not found 会自己 apt-get 装一次再重试），双保险。
+      - name: Install poppler-utils (PDF 解析：页数/文字层/转图)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          pdfinfo -v 2>&1 | head -1
+
       - name: Run cloud exam job
         env:
           GIST_ID: ${{ github.event.inputs.gist_id }}
