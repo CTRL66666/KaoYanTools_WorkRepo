@@ -41,9 +41,55 @@ const { URL } = require('url');
 const API = 'https://api.github.com';
 const GIST_ID = process.env.GIST_ID || '';
 const GH_TOKEN = process.env.GH_TOKEN || '';
+/* 【2026-09-02 PDF 导入】通用 shell 执行（poppler 工具链：pdfinfo/pdftotext/pdftoppm）。
+ * Actions runner 自带 poppler-utils，零安装。参数一律 JSON.stringify 引号化防注入；
+ * 只允许跑本机二进制，不接收任何来自 Gist/AI 的命令文本。 */
+function runShell(cmd, timeoutMs, maxBuffer) {
+  return new Promise((resolve) => {
+    cpExec(cmd, { timeout: timeoutMs || 60000, maxBuffer: maxBuffer || 8 * 1024 * 1024, cwd: process.cwd(),
+      env: { PATH: process.env.PATH || '', HOME: process.env.HOME || '', LANG: 'C.UTF-8' } },
+      (err, stdout, stderr) => resolve({ ok: !err, out: String(stdout || ''), err: err ? (String(stderr || '').slice(0, 400) || err.message) : '' }));
+  });
+}
+/* gist 大文件（>1MB 会被 API 响应截断）：抓 raw_url。secret gist 的 raw 匿名 404，
+ * 必须带 GH_TOKEN；返回 Buffer（PDF/base64 都可能非 UTF-8 安全）。 */
+function ghGetRawBuffer(urlStr) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const req = https.request({
+      hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + GH_TOKEN, 'User-Agent': 'kaoyan2026-cloudjob-runner' },
+      timeout: 120000
+    }, res => {
+      if (res.statusCode >= 400) { res.resume(); return reject(new Error('raw HTTP ' + res.statusCode)); }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('timeout', () => req.destroy(new Error('raw 拉取超时')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+// 取 gist 中某文件的完整文本（truncated 时自动走 raw_url 回补）
+async function gistFileText(files, name) {
+  const f = files && files[name];
+  if (!f) return null;
+  if (!f.truncated) return f.content;
+  if (!f.raw_url) throw new Error(name + ' 过大且无 raw_url（无法回补）');
+  const buf = await ghGetRawBuffer(f.raw_url);
+  return buf.toString('utf8');
+}
+async function gistFileBuffer(files, name) {
+  const f = files && files[name];
+  if (!f) return null;
+  if (!f.truncated) return Buffer.from(f.content || '', 'utf8');
+  if (!f.raw_url) throw new Error(name + ' 过大且无 raw_url（无法回补）');
+  return await ghGetRawBuffer(f.raw_url);
+}
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-const RUNNER_VER = 'v9';
+const RUNNER_VER = 'v10';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -194,6 +240,7 @@ async function flushPartial(questions, opts) {
       updatedAt: new Date().toISOString(),
       questions: list
     };
+    if (opts.imported) payload.imported = true;   // v10：导入通道落盘标记（客户端据此区分抢救卷类型）
     try {
       await ghRetry('PATCH', '/gists/' + GIST_ID, { files: { 'partial.json': { content: JSON.stringify(payload) } } }, 3);
       _partialCount = list.length;
@@ -621,6 +668,223 @@ process.on('SIGTERM', () => handleTermination('SIGTERM'));
 process.on('SIGINT', () => handleTermination('SIGINT'));
 
 // ---------- 主流程 ----------
+// ==================== 📥 PDF 试卷导入（v10，2026-09-02 新增通道） ====================
+/* 与「出卷通道」平行的第二条云端流水线：客户端把用户试卷（PDF/图片）base64 塞进
+ * 任务 Gist（source.pdf.b64 或 source.pdf），云端用 Actions runner 自带的 poppler 工具链解析：
+ *   pdfinfo 页数 → 逐页 pdftotext 判断文字层密度
+ *   → 文字页按连续页分组喂文本模型；扫描页 pdftoppm 转 PNG 喂视觉模型
+ *   → 逐题结构校验 + 跨组去重 → 每组识别完即 flushPartial 落盘（中途失败可抢救）
+ *   → result.json（builtBy:'pdf-import'，结构与 mockExams 条目一致）
+ * 零幻觉铁律：识别不出的题只标记（lowConfidence/noAnswer）绝不编造；
+ * 客户端收卷后走「预览确认」人工修订，未经人工过目的导入不当成品用。 */
+const IMG_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+function extOf(name) { const m = String(name || '').toLowerCase().match(/\.(\w+)$/); return m ? m[1] : ''; }
+function importTextSystem(subj) {
+  return '你是考研' + subjName(subj) + '试卷数字化工程师。用户给你一份试卷其中几页的文字层提取（pdftotext 输出，'
+    + '可能含页眉页脚、双栏错序、公式残缺、题目跨页）。任务：把每一道题完整还原成结构化 JSON。'
+    + '【铁律】①只做搬运与整理，严禁增删改题意、严禁编造卷面上没有的答案或解析——卷面没给答案就输出 answer:"" 并置 noAnswer:true。'
+    + '②题目跨页出现时合并为一题（sourcePages 给全部页码）。③公式保留为 LaTeX（$...$），文字层里错乱的上下标/根号按你能确定的最小修改还原；'
+    + '拿不准是否还原正确就把 confidence 调低（0-1 小数），不要猜。④题号 no 用卷面原题号（数字），分卷/无题号按出现顺序编号。'
+    + '⑤页眉页脚、答题卡填涂说明、注意事项等非试题文字一律丢弃。'
+    + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"sourcePages":[1],"confidence":0.95}]}';
+}
+function importVisionSystem(subj) {
+  return '你是考研' + subjName(subj) + '试卷数字化工程师。用户给你试卷整页的高清图片（扫描版/拍照版）。'
+    + '任务：逐题识别图片中的试题，还原成结构化 JSON。'
+    + '【铁律】①忠实转录：识别什么输出什么，严禁补全图片里没有的题干、答案或解析；看不清的字用 □ 占位并调低 confidence。'
+    + '②卷面没印答案就 answer:"" + noAnswer:true，严禁用你的知识"顺手解出来"冒充卷面答案。'
+    + '③数学公式必须用 LaTeX（$...$）准确还原（分式/根号/上下标/积分号）。④题号 no 用卷面原题号。'
+    + '⑤一道题跨页时在两页都识别完整部分，sourcePages 标该页即可（合并由系统处理）。'
+    + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"sourcePages":[1],"confidence":0.95}]}';
+}
+// 导入题结构校验（与出卷题的 validateQuestion 不同：忠实搬运优先，残次不判死只标记）
+function validateImported(q) {
+  if (!q || typeof q !== 'object' || !q.stem || String(q.stem).trim().length < 6) return '题干缺失';
+  const t = ['choice', 'fill', 'solve', 'essay'].indexOf(String(q.type)) >= 0 ? String(q.type) : ((Array.isArray(q.options) && q.options.length === 4) ? 'choice' : 'solve');
+  if (t === 'choice' && (!Array.isArray(q.options) || q.options.length < 2)) return '选择题缺选项';
+  if (t === 'choice' && Array.isArray(q.options) && q.options.length === 4 && q.answer) {
+    const letters = q.options.map(o => String(o || '').trim().charAt(0).toUpperCase());
+    if (letters.indexOf(String(q.answer).trim().charAt(0).toUpperCase()) < 0) return '答案不在选项中';
+  }
+  return '';
+}
+function normalizeImported(q, g) {
+  let type = ['choice', 'fill', 'solve', 'essay'].indexOf(String(q.type)) >= 0 ? String(q.type) : ((Array.isArray(q.options) && q.options.length === 4) ? 'choice' : 'solve');
+  let options = Array.isArray(q.options) ? q.options.filter(o => o != null && String(o).trim() !== '').map(o => String(o)) : [];
+  let stem = String(q.stem || '').trim();
+  let low = false;
+  const conf = typeof q.confidence === 'number' ? q.confidence : null;
+  if (conf != null && conf < 0.7) low = true;
+  // 选择题结构不完整：把选项并入题干（忠实保留信息），降级 solve——判分管线对坏 choice 会直接报错
+  if (type === 'choice' && (options.length !== 4 || !options.length)) {
+    if (options.length >= 2) stem += '\n' + options.join('\n');
+    options = []; type = 'solve'; low = true;
+  }
+  let answer = q.answer == null ? '' : String(q.answer).trim();
+  const noAnswer = !!q.noAnswer || answer === '';
+  if (noAnswer) low = true;
+  // choice 答案不在选项内（validateImported 拦下）→ 同样标低置信，交人工裁决
+  if (validateImported(q)) low = true;
+  let pages = Array.isArray(q.sourcePages) && q.sourcePages.length ? q.sourcePages.map(Number).filter(n => n > 0) : (g.pages || []);
+  return {
+    no: Number(q.no) || null,
+    stem: stem, type: type, options: options.length === 4 ? options : undefined,
+    answer: answer, solution: q.solution == null ? '' : String(q.solution).trim(),
+    noAnswer: noAnswer, topicName: q.topicName == null ? '' : String(q.topicName).trim(),
+    score: typeof q.score === 'number' && q.score > 0 ? q.score : null,
+    sourcePages: pages, confidence: conf, lowConfidence: low,
+    fromImport: true, importKind: g.kind, importNote: validateImported(q) || ''
+  };
+}
+async function runImport(gist, job, prefs) {
+  const subj = prefs.subject && prefs.subject !== 'auto' ? prefs.subject : (prefs.importSubject || 'math');
+  // ---------- ① 拉源文件 ----------
+  await setStatus('running', 'parsing', '📥 拉取试卷源文件…', 2);
+  const gFiles = gist.files || {};
+  let buf = null;
+  try {
+    if (gFiles['source.pdf']) buf = await gistFileBuffer(gFiles, 'source.pdf');
+    else if (gFiles['source.pdf.b64']) {
+      const t = await gistFileText(gFiles, 'source.pdf.b64');
+      if (t) buf = Buffer.from(String(t).replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+    }
+  } catch (e) { throw new Error('源文件读取失败：' + ((e && e.message) || e)); }
+  if (!buf || buf.length < 100) throw new Error('任务 Gist 里没有试卷源文件（source.pdf / source.pdf.b64 均缺失）——请确认提交时已随任务上传，或用「📄 导入整卷」重新发起');
+  const isImg = prefs.importKind === 'image';
+  pushLog('📄 源文件 ' + Math.round(buf.length / 1024) + ' KB · 类型 ' + (isImg ? '图片' : 'PDF') + ' · ' + (prefs.fileName || '(未命名)'));
+  if (!isImg && !(buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46)) {
+    throw new Error('源文件不是合法 PDF（缺少 %PDF 头）——若是图片请改用图片导入');
+  }
+  const wd = pathT.join(osT.tmpdir(), 'cjimp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7));
+  fsT.mkdirSync(wd, { recursive: true });
+  try {
+    // ---------- ② 分组（文字组 / 视觉组） ----------
+    const groups = [];
+    if (isImg) {
+      const mime = IMG_MIME[extOf(prefs.fileName)] || 'image/png';
+      if (buf.length > 2.6 * 1024 * 1024) throw new Error('图片过大（' + Math.round(buf.length / 1048576) + ' MB > 2.6 MB 接口上限），请在手机端压缩后重试');
+      groups.push({ kind: 'img', imgs: ['data:' + mime + ';base64,' + buf.toString('base64')], pages: [1] });
+    } else {
+      const pdfPath = pathT.join(wd, 'src.pdf');
+      fsT.writeFileSync(pdfPath, buf);
+      const vi = await runShell('pdfinfo ' + JSON.stringify(pdfPath), 30000);
+      if (!vi.ok) throw new Error('PDF 解析失败（文件损坏或加密受保护）：' + String(vi.err).slice(0, 200));
+      const pm = vi.out.match(/^Pages:\s+(\d+)/m);
+      const pages = pm ? parseInt(pm[1], 10) : 0;
+      if (!pages) throw new Error('PDF 页数为 0');
+      if (pages > 40) throw new Error('共 ' + pages + ' 页，超过单次导入上限 40 页（建议拆分后分批导入）');
+      pushLog('🧾 pdfinfo：' + pages + ' 页，逐页提取文字层…');
+      const pgTxt = {};
+      for (let p = 1; p <= pages; p++) {
+        await checkCancel();   // 每页边界：拉取用户取消信号
+        const r = await runShell('pdftotext -f ' + p + ' -l ' + p + ' -layout ' + JSON.stringify(pdfPath) + ' -', 30000);
+        pgTxt[p] = r.ok ? r.out : '';
+        if (p === 1 || p === pages || p % 5 === 0) await setStatus('running', 'parsing', '🧾 逐页提取文字层 ' + p + '/' + pages + '…', 2 + Math.round(p / pages * 10));
+      }
+      // 文字密度阈值：pdftotext 压掉空白后 <240 字符判为「扫描页/公式页」，转图走视觉
+      const TEXT_MIN = 240;
+      let tGroup = [];
+      const flushT = () => { if (tGroup.length) { groups.push({ kind: 'text', text: tGroup.map(g => g.txt).join('\n\n'), pages: tGroup.map(g => g.p) }); tGroup = []; } };
+      const imgPages = [];
+      for (let p = 1; p <= pages; p++) {
+        const flat = String(pgTxt[p] || '').replace(/\s+/g, '').trim();
+        if (flat.length >= TEXT_MIN) tGroup.push({ p: p, txt: pgTxt[p] });
+        else { flushT(); imgPages.push(p); }
+      }
+      flushT();
+      if (imgPages.length) pushLog('👁 文字层不足 ' + TEXT_MIN + ' 字符的页：' + imgPages.join(',') + '（转 150dpi 图片走视觉识别）');
+      for (let i = 0; i < imgPages.length; i += 2) {
+        const chunk = imgPages.slice(i, i + 2);
+        const pngs = [];
+        for (const p of chunk) {
+          const base = pathT.join(wd, 'pg' + p);
+          const r = await runShell('pdftoppm -f ' + p + ' -l ' + p + ' -png -r 150 ' + JSON.stringify(pdfPath) + ' ' + JSON.stringify(base), 90000);
+          if (!r.ok) { pushLog('⚠️ 第 ' + p + ' 页转图失败：' + String(r.err).slice(0, 120), 'warn'); continue; }
+          for (const f of fsT.readdirSync(wd).filter(x => x.indexOf('pg' + p) === 0 && /\.png$/.test(x))) {
+            const data = fsT.readFileSync(pathT.join(wd, f));
+            if (data.length > 2.6 * 1024 * 1024) { pushLog('⚠️ 第 ' + p + ' 页图 ' + Math.round(data.length / 1048576) + 'MB 过大，跳过', 'warn'); continue; }
+            pngs.push('data:image/png;base64,' + data.toString('base64'));
+          }
+        }
+        if (pngs.length) groups.push({ kind: 'img', imgs: pngs, pages: chunk });
+      }
+    }
+    if (!groups.length) throw new Error('没有可识别的页面（文字层与转图均失败）');
+    pushLog('🗂 识别分组：' + groups.map(g => g.kind + '(' + g.pages.join('+') + ')').join(' · '));
+    await setStatus('running', 'parsing', '🗂 ' + groups.length + ' 组页面就绪（文字 ' + groups.filter(g => g.kind === 'text').length + ' · 视觉 ' + groups.filter(g => g.kind === 'img').length + '）', 13);
+    // ---------- ③ 逐组识别（并发 3，组内按页保序） ----------
+    const all = [];
+    const failedGroups = [];
+    await pool(groups, 3, async (g) => {
+      await cancelCheckpoint();
+      const userTxt = g.kind === 'text'
+        ? '【第 ' + g.pages.join('、') + ' 页 · 文字层提取】\n' + String(g.text).slice(0, 24000)
+        : '【第 ' + g.pages.join('、') + ' 页 · 整页图片】请从图片逐题识别。';
+      const sys = g.kind === 'text' ? importTextSystem(subj) : importVisionSystem(subj);
+      const msgs = g.kind === 'img'
+        ? [{ role: 'system', content: sys }, { role: 'user', content: [{ type: 'text', text: userTxt }].concat(g.imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }]
+        : [{ role: 'system', content: sys }, { role: 'user', content: userTxt }];
+      let res;
+      try { res = await aiJson(msgs, { think: false, temperature: 0.1 }); }
+      catch (e) {
+        const m = String((e && e.message) || e);
+        failedGroups.push({ pages: g.pages, err: m.slice(0, 160) });
+        pushLog('⚠️ 第 ' + g.pages.join(',') + ' 页组识别失败：' + m.slice(0, 140), 'warn');
+        return { __err: m };
+      }
+      const rawList = res && Array.isArray(res.questions) ? res.questions : (Array.isArray(res) ? res : []);
+      const qs = [];
+      for (const raw of rawList) {
+        try { qs.push(normalizeImported(raw, g)); } catch (e) { pushLog('⚠️ 一题规范化失败已跳过：' + String(e.message || e).slice(0, 100), 'warn'); }
+      }
+      qs.forEach(q => all.push(q));
+      // 每组识别完立即落盘 partial.json（含 imported 标记）：中途失败/停止也能抢救已识别题
+      await flushPartial(all, { subject: subj, imported: true });
+      pushLog('🔎 第 ' + g.pages.join(',') + ' 页（' + g.kind + '）识别出 ' + qs.length + ' 题，累计 ' + all.length + ' 题已落盘');
+      return { n: qs.length };
+    }, (d, n) => setStatus('running', 'extracting', '🔎 AI 拆题中（' + d + '/' + n + ' 组 · 已识出 ' + all.length + ' 题）…', 15 + Math.round(d / n * 65)));
+    if (!all.length) {
+      throw new Error('所有页面识别失败（共 ' + groups.length + ' 组' + (failedGroups.length ? '：' + failedGroups.map(f => 'P' + f.pages.join('+') + ' ' + f.err).join('；') : '') + '）');
+    }
+    // ---------- ④ 合并去重 + 排序 + 打包 ----------
+    await cancelCheckpoint();
+    await setStatus('running', 'finalizing', '📦 整理成卷…', 85);
+    const seen = {};
+    const uniq = [];
+    for (const q of all) {
+      const k = String(q.stem).replace(/\s+/g, '').slice(0, 90);
+      if (seen[k]) continue;
+      seen[k] = 1; uniq.push(q);
+    }
+    const dropped = all.length - uniq.length;
+    if (dropped) pushLog('🧹 跨页边界去重：丢弃 ' + dropped + ' 道重复题');
+    uniq.sort((a, b) => ((a.sourcePages[0] || 0) - (b.sourcePages[0] || 0)) || ((Number(a.no) || 0) - (Number(b.no) || 0)));
+    uniq.forEach((q, i) => { if (q.no == null) q.no = i + 1; });
+    const lowN = uniq.filter(q => q.lowConfidence).length;
+    const totalScore = uniq.reduce((a, q) => a + (Number(q.score) || 0), 0);
+    const exam = {
+      id: job.jobId + '-imp',
+      title: (String(prefs.importTitle || '').trim() || '📄 导入试卷').slice(0, 60) + '（' + uniq.length + ' 题）',
+      subject: subj,
+      timeLimit: Number(prefs.importTimeLimit) > 0 ? Number(prefs.importTimeLimit) : Math.max(30, uniq.length * 6),
+      totalScore: totalScore || uniq.length * 5,
+      questions: uniq,
+      imported: true, lowConfidenceCount: lowN, failedPages: failedGroups.map(f => f.pages.join('+')),
+      builtBy: 'pdf-import', generatedAt: new Date().toISOString()
+    };
+    pushLog('✅ 识别完成：' + uniq.length + ' 题 · 待人工复核 ' + lowN + ' 题' + (failedGroups.length ? ' · 失败页组 ' + failedGroups.length : ''));
+    await flushPartial(uniq, { subject: subj, imported: true });
+    await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
+      'result.json': { content: JSON.stringify(exam) },
+      'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📄 识别完成（' + uniq.length + ' 题 · 待复核 ' + lowN + '），可收卷导入预览确认', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, imported: true, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
+    } });
+    log('✅ 导入任务完成');
+  } finally {
+    try { fsT.rmSync(wd, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// ---------- 主流程 ----------
 (async function main() {
   // 供 catch（取消/失败路径）使用：try 块内 let/const 的作用域到不了 catch，
   // 若在 catch 里直接引用 gist/subj 会 ReferenceError 崩进程 → partial 卷写不出去。
@@ -679,8 +943,7 @@ process.on('SIGINT', () => handleTermination('SIGINT'));
     }
 
     // ①.5 自检模式：只验证链路（Gist 读写 + secret 有效 + AI 配置在场），不调 AI、不耗 token
-    if (prefs.check) {
-      const aiOk = !!(aiConf('endpoint') && aiConf('key') && aiConf('model'));
+    if (prefs.check) {const aiOk = !!(aiConf('endpoint') && aiConf('key') && aiConf('model'));
       await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
         'result.json': { content: JSON.stringify({ cloudJobCheck: true, ok: true, aiConfigPresent: aiOk, checkedAt: new Date().toISOString() }) },
         'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '🧪 自检通过：Gist 读写 ✓ · CLOUDJOB_GH_TOKEN ✓ · AI 配置在场' + (aiOk ? ' ✓' : ' ✗'), progress: 100, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
@@ -690,6 +953,11 @@ process.on('SIGINT', () => handleTermination('SIGINT'));
     }
     const subj = prefs.subject === 'auto' ? 'math' : (prefs.subject || 'math');   // auto 由规划阶段自行判断科目语境
     JOB_SUBJ = subj;
+    // 【v10 导入通道】prefs.mode==='import' → 走 PDF/图片识别流水线，与出卷流水线平行
+    if (prefs.mode === 'import') {
+      await runImport(gist, job, prefs);
+      return;
+    }
     log('接单', job.jobId, JSON.stringify(prefs));
     pushLog('📋 接单 ' + job.jobId + ' · ' + (SUBJ_NAME[subj] || subj) + ' · 难度 ' + (prefs.diff || 'mix') + ' · 模型 ' + (aiConf('model') || '?') + ' · maxTok ' + JOB_MAXTOK + (JOB_THINK ? ' · 💭 思考模式' : ' · ⚡ 不思考(结构化)'));
     pushLog('🧠 思考开关已对齐本地：' + (JOB_THINK ? '开启（若思考模型烧光 token 会自动关思考降级）' : '关闭（结构化 JSON 默认不思考，避免空正文卡死）'));
