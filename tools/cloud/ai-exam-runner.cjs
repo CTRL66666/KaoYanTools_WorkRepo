@@ -40,6 +40,7 @@ const { URL } = require('url');
 
 const API = 'https://api.github.com';
 const GIST_ID = process.env.GIST_ID || '';
+const SOURCE_GIST_ID = process.env.SOURCE_GIST_ID || '';   // 【v11】PDF 导入时源文件所在独立 Gist（任务 Gist 截断时绕路用）
 const GH_TOKEN = process.env.GH_TOKEN || '';
 /* 【2026-09-02 PDF 导入】通用 shell 执行（poppler 工具链：pdfinfo/pdftotext/pdftoppm）。
  * Actions runner 自带 poppler-utils，零安装。参数一律 JSON.stringify 引号化防注入；
@@ -71,25 +72,43 @@ function ghGetRawBuffer(urlStr) {
     req.end();
   });
 }
-// 取 gist 中某文件的完整文本（truncated 时自动走 raw_url 回补）
+// 取 gist 中某文件的完整文本：truncated 或 content 缺失/空/与 size 对不上时都走 raw_url 回补。
+// 教训：2026-09-02 导入任务因此崩在 JSON.parse 失败（GitHub Gist API 在大文件边界下
+// 偶发把小文件 content 置空、不标 truncated——L902 守卫只看 key 不看 content 就掉坑）。
 async function gistFileText(files, name) {
   const f = files && files[name];
   if (!f) return null;
-  if (!f.truncated) return f.content;
-  if (!f.raw_url) throw new Error(name + ' 过大且无 raw_url（无法回补）');
+  const needRaw = !!f.truncated || !f.content || !f.content.length
+    || (f.size && f.content.length < f.size);
+  if (!needRaw) return f.content;
+  if (!f.raw_url) throw new Error(name + ' content 缺失且无 raw_url（无法回补）');
   const buf = await ghGetRawBuffer(f.raw_url);
   return buf.toString('utf8');
 }
 async function gistFileBuffer(files, name) {
   const f = files && files[name];
   if (!f) return null;
-  if (!f.truncated) return Buffer.from(f.content || '', 'utf8');
-  if (!f.raw_url) throw new Error(name + ' 过大且无 raw_url（无法回补）');
+  const needRaw = !!f.truncated || !f.content || !f.content.length
+    || (f.size && f.content.length < f.size);
+  if (!needRaw) return Buffer.from(f.content, 'utf8');
+  if (!f.raw_url) throw new Error(name + ' content 缺失且无 raw_url（无法回补）');
   return await ghGetRawBuffer(f.raw_url);
+}
+// 【v11】从资源 Gist / 任务 Gist 读 PDF/图片源文件：先 source.pdf（>1MB 走 b64 走 b64 通道）
+async function readSourceBuffer(files, tag) {
+  if (files['source.pdf']) return await gistFileBuffer(files, 'source.pdf');
+  if (files['source.pdf.b64']) {
+    const t = await gistFileText(files, 'source.pdf.b64');
+    if (!t) return null;
+    return Buffer.from(String(t).replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+  }
+  // 标签友好化：资源 Gist 'source.pdf.b64' / 任务 Gist 'source.pdf.b64'，但报错时区分
+  if (Object.keys(files || {}).length === 0) throw new Error(tag + ' 内无任何 files');
+  throw new Error(tag + ' 内没有 source.pdf / source.pdf.b64（候选 files：' + Object.keys(files).join(',') + '）');
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-const RUNNER_VER = 'v10';
+const RUNNER_VER = 'v11';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -740,18 +759,29 @@ async function runImport(gist, job, prefs) {
   const subj = prefs.subject && prefs.subject !== 'auto' ? prefs.subject : (prefs.importSubject || 'math');
   // ---------- ① 拉源文件 ----------
   await setStatus('running', 'parsing', '📥 拉取试卷源文件…', 2);
+  // 【v11 资源 Gist 拆文件】优先从独立资源 Gist 读源文件（任务 Gist 永远只几 KB，
+  // 不再与几 MB 的 PDF 同 Gist 触发 GitHub API 截断边界）。回退到任务 Gist 内源文件（兼容老路径）。
   const gFiles = gist.files || {};
   let buf = null;
+  let sourceOrigin = '';
   try {
-    if (gFiles['source.pdf']) buf = await gistFileBuffer(gFiles, 'source.pdf');
-    else if (gFiles['source.pdf.b64']) {
-      const t = await gistFileText(gFiles, 'source.pdf.b64');
-      if (t) buf = Buffer.from(String(t).replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+    if (SOURCE_GIST_ID) {
+      const assetGist = await ghRetry('GET', '/gists/' + SOURCE_GIST_ID);
+      const aFiles = (assetGist && assetGist.files) || {};
+      buf = await readSourceBuffer(aFiles, '资源 Gist');
+      sourceOrigin = 'resource gist ' + SOURCE_GIST_ID;
+      pushLog('📂 源文件来自资源 Gist（' + Math.round(buf.length / 1024) + 'KB，gist=' + SOURCE_GIST_ID.slice(0, 8) + '…）');
     }
-  } catch (e) { throw new Error('源文件读取失败：' + ((e && e.message) || e)); }
-  if (!buf || buf.length < 100) throw new Error('任务 Gist 里没有试卷源文件（source.pdf / source.pdf.b64 均缺失）——请确认提交时已随任务上传，或用「📄 导入整卷」重新发起');
+  } catch (e) { pushLog('⚠️ 资源 Gist 读取失败，回退任务 Gist：' + String(e.message || e).slice(0, 120), 'warn'); }
+  if (!buf) {
+    try {
+      buf = await readSourceBuffer(gFiles, '任务 Gist');
+      sourceOrigin = 'task gist';
+    } catch (e) { throw new Error('源文件读取失败：' + ((e && e.message) || e)); }
+  }
+  if (!buf || buf.length < 100) throw new Error('源文件读取为空（来源：' + sourceOrigin + '）——请确认提交时已上传试卷文件，或删除任务重试');
   const isImg = prefs.importKind === 'image';
-  pushLog('📄 源文件 ' + Math.round(buf.length / 1024) + ' KB · 类型 ' + (isImg ? '图片' : 'PDF') + ' · ' + (prefs.fileName || '(未命名)'));
+  pushLog('📄 源文件 ' + Math.round(buf.length / 1024) + ' KB · 类型 ' + (isImg ? '图片' : 'PDF') + ' · ' + (prefs.fileName || '(未命名)') + ' · 来源 ' + sourceOrigin);
   if (!isImg && !(buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46)) {
     throw new Error('源文件不是合法 PDF（缺少 %PDF 头）——若是图片请改用图片导入');
   }
@@ -901,9 +931,20 @@ async function runImport(gist, job, prefs) {
     }
     if (!gist || !gist.files || !gist.files['job.json']) throw new Error('Gist 缺 job.json');
     JOB_GIST = gist;
-    const job = JSON.parse(gist.files['job.json'].content);
+    // 【2026-09-02 容错】用容错读取（content 缺失/空/size 不符自动 raw_url 回补）；
+    // 万一仍失败，把 GIST_ID + files keys/sizes 全打出来方便直接定位
+    var jobJsonRaw = await gistFileText(gist.files, 'job.json');
+    if (!jobJsonRaw) {
+      var fk = Object.keys(gist.files || {}).map(function (k) {
+        var f = gist.files[k];
+        return k + '(size=' + (f.size || 0) + ',truncated=' + !!f.truncated + ',contentLen=' + (f.content ? f.content.length : 0) + ')';
+      }).join(',');
+      throw new Error('GIST_ID=' + GIST_ID + ' job.json 读取为空/损坏。files=' + fk);
+    }
+    const job = JSON.parse(jobJsonRaw);
     JOB_JOBID = String(job.jobId || '');
-    const stNow = gist.files['status.json'] ? JSON.parse(gist.files['status.json'].content) : {};
+    var statusJsonRaw = gist.files['status.json'] ? await gistFileText(gist.files, 'status.json') : '{}';
+    const stNow = JSON.parse(statusJsonRaw || '{}');
     if (stNow.status === 'canceled') { log('任务已被用户取消，直接退出'); return; }
     const prefs = job.prefs || {};
     /* 【H1 断点续跑】job.resume 存在 → 从 partial.json 取回上次已出的题，只补缺口。
