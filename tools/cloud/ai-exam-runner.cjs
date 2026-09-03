@@ -131,7 +131,7 @@ async function readSourceBuffer(files, tag) {
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-const RUNNER_VER = 'v11';
+const RUNNER_VER = 'v12';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -271,9 +271,25 @@ let SAVED = [];
 //      落盘终稿后即使这一步挂了，客户端仍能抢救到「经过审查的完整卷」而非初稿。
 let _flushChain = Promise.resolve();
 let _partialCount = 0;   // 已成功落盘的题数（写进 status.json.savedCount，即「可抢救数量」）
+// 【2026-09-03 配额治理】每题完成即写 partial.json 的「全集」是第二烧配额大户：
+// 22 题卷子 = 22 次 PATCH，且 payload 随题目累积越来越大。改为「每 3 题或距上次 ≥90s」
+// 落一次（opts.force 绕过节流）：抢救粒度从「最多丢 1 题」变「最多丢 3 题/90s」，
+// 而一题要 30s~2min —— 实际丢题窗口 <1 题，几乎无损。终稿/取消/失败前抢救一律 force。
+// 【竞态修正】节流计数改为「同步预约」：旧实现在异步链内 PATCH 成功后才更新 _lastFlushCount，
+// 并发完成多题时它们同步检查看到的都是旧值 → 全部通过节流各自排队（harness 实测 6 题落 7 次）。
+// 现在决策与预约在函数顶部同步完成，异步链只负责 PATCH——后续调用立即看到已预约的题数。
+let _flushAt = 0, _flushCount = 0;   // 最近一次「已发起」落盘的时刻与题数（同步预约，非落盘成功）
+const _FLUSH_EVERY_N = 3, _FLUSH_MIN_MS = 90000;
 async function flushPartial(questions, opts) {
   opts = opts || {};
   const list = (questions || []).filter(q => q && q.stem);
+  const now = Date.now();
+  if (!opts.force) {
+    if (list.length > 0 && list.length <= _flushCount) return _flushChain;   // 已被预约覆盖（无更新的题）
+    if (_flushCount > 0 && list.length - _flushCount < _FLUSH_EVERY_N
+        && now - _flushAt < _FLUSH_MIN_MS) return _flushChain;   // 节流窗口内攒着
+  }
+  _flushAt = now; _flushCount = list.length;   // 同步预约：本次将落盘 list.length 题
   _flushChain = _flushChain.then(async () => {
     const payload = {
       count: list.length,
@@ -308,17 +324,65 @@ function readPartialJson(gist) {
 }
 
 // setStatus 串行化：多 worker 并发完成时 PATCH 同一 gist 文件，链式排队避免互踩/乱序
+//
+// 【2026-09-03 配额救星·状态回写风暴治理】旧实现每次状态变更都全量 PATCH status.json
+// （带整个 RUN_LOG + 全部 QS），一次 22 题出卷光「每题开工写一次 + 完成写一次」就烧 ~44 次
+// PATCH，叠加 flushPartial 每题全集重写、checkCancel 每题探测，单任务 PATCH+GET 逼近 150 次。
+// 多任务并发或本地云同步同时轮询时，一小时 5000 配额轻松烧穿 → 「进度冻结一小时」。
+// 三重治理（均不改变出题质量与抢救能力）：
+//   ① 去重：status+stage+msg+progress 全同 → 直接跳过（不写）。
+//   ② 节流合并：同阶段内非终态且距上次真实写 < 8s → 只保留「最新一条」待发，窗口到点写一次。
+//      并发出题时 genDone 递增被合并，进度条不倒退。
+//   ③ 立即写：终态（done/error/canceled）、阶段切换（planning→generating 等里程碑）、
+//      force（调用方显式要求）绕过节流，保证关键节点即时可见。
 let _stChain = Promise.resolve();
-function setStatus(status, stage, msg, progress) {
+const _ST_THROTTLE_MS = 8000;
+let _stLast = { key: '', at: 0, stage: '' };
+let _stPending = null;   // { status, stage, msg, progress, timer }
+function _stKey(status, stage, msg, progress) { return [status, stage, msg, progress].join('|'); }
+function setStatus(status, stage, msg, progress, force) {
+  const key = _stKey(status, stage, msg, progress);
+  const now = Date.now();
+  const terminal = status !== 'running';   // done/error/canceled 必须即时
+  const stageChanged = stage !== _stLast.stage;   // 阶段切换是里程碑，立即写
+  // ① 去重：与上次真实写入完全相同 → 跳过
+  if (!force && !terminal && !stageChanged && key === _stLast.key) return _stChain;
+  // ② 节流合并：同阶段内非终态非强制 + 距上次写 < 窗口 → 攒最新待发（旧待发被覆盖）
+  if (!force && !terminal && !stageChanged && (now - _stLast.at) < _ST_THROTTLE_MS) {
+    if (_stPending) clearTimeout(_stPending.timer);
+    const pend = { status, stage, msg, progress };
+    pend.timer = setTimeout(function () {
+      if (_stPending === pend) _stPending = null;
+      _stChain = _stChain.then(() => _setStatus(status, stage, msg, progress)).catch(() => {});
+    }, _ST_THROTTLE_MS - (now - _stLast.at));
+    _stPending = pend;
+    return _stChain;
+  }
+  // ③ 立即写（force / 终态 / 超窗口）：先丢弃待发（本次已含其最新信息）
+  if (_stPending) { clearTimeout(_stPending.timer); _stPending = null; }
   _stChain = _stChain.then(() => _setStatus(status, stage, msg, progress)).catch(() => {});
   return _stChain;
+}
+// 强制冲刷待发状态（终止/收卷等关键退出点调用，确保节流攒着的最后进度不丢）
+function flushPendingStatus() {
+  if (_stPending) {
+    const p = _stPending; _stPending = null;
+    clearTimeout(p.timer);
+    _stChain = _stChain.then(() => _setStatus(p.status, p.stage, p.msg, p.progress)).catch(() => {});
+  }
+  return _stChain;
+}
+// 丢弃待发状态（调用方紧接着要用 ghRetry 直写终态时用）：终态已含最新信息，
+// 若不清待发，8s 后迟到的 running PATCH 会把刚写好的 done/error 覆盖回去。
+function dropPendingStatus() {
+  if (_stPending) { clearTimeout(_stPending.timer); _stPending = null; }
 }
 async function _setStatus(status, stage, msg, progress) {
   pushLog((stage ? '[' + stage + '] ' : '') + (msg || ''));
   // savedCount = 已成功落盘到 partial.json 的题数（= 客户端随时能抢救走的数量），
   // 让本地无需额外拉 Gist 就知道「现在有几题可抢救」，任务行可直接显示入口。
   const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) } } };
-  try { await ghRetry('PATCH', '/gists/' + GIST_ID, payload); log('status →', status, stage || '', msg || ''); return true; }
+  try { await ghRetry('PATCH', '/gists/' + GIST_ID, payload); _stLast = { key: _stKey(status, stage, msg, progress), at: Date.now(), stage: stage }; log('status →', status, stage || '', msg || ''); return true; }
   catch (e) {
     const hint = (e && e.status === 404)
       ? '　👉 诊断：能读 job.json 却写不回 status，几乎可断定 CLOUDJOB_GH_TOKEN 对 Gist 缺「写」权限（请用 classic PAT 勾选 gist，或 fine-grained PAT 把 Gist 设为 Read & Write）'
@@ -534,10 +598,13 @@ class CancelError extends Error { constructor(m) { super(m); this.name = 'Cancel
  * 取消前根本不存在 → _cancelCache 永远是 null → 每次探测都是真实 GET（全量 gist，
  * 随 partial.json 增长越来越大）。35 题的卷子光取消探测就烧 ~100 次配额。
  * 节流到 20s 一次：取消延迟 ≤20s + 题边界，用户无感；配额省下一个数量级。
- * 已取消则永久缓存（取消不可逆）；阶段边界 cancelCheckpoint(force) 不受节流约束。 */
+ * 已取消则永久缓存（取消不可逆）；阶段边界 cancelCheckpoint(force) 不受节流约束。
+ * 【2026-09-03 再放宽到 30s】取消探测是无条件 GET 整个 gist（含已落盘的 partial.json 全集，
+ * 越跑越大），是继 setStatus/flushPartial 之后的第三配额大户。放宽到 30s：取消响应延迟
+ * ≤30s + 题边界（一题本就 30s~2min，用户点停止后最迟下一题边界生效），配额再省 1/3。 */
 async function checkCancel(force) {
   if (_cancelCache && _cancelCache.canceled) return _cancelCache;
-  if (!force && Date.now() - _cancelCheckedAt < 20000) return _cancelCache;
+  if (!force && Date.now() - _cancelCheckedAt < 30000) return _cancelCache;
   _cancelCheckedAt = Date.now();
   try {
     const g = await ghRetry('GET', '/gists/' + GIST_ID);
@@ -561,6 +628,13 @@ async function pool(items, conc, worker, onEachDone) {
       const ci = await checkCancel();
       if (ci && ci.canceled) break;                       // 已取消：不再取新题
       const i = idx++;
+      // 【2026-09-03 竞态修复】while 检查与真正取号之间隔着 await checkCancel()——并发 worker
+      // 可能同时通过检查，恢复后 idx++ 越过 items.length 拿到幽灵下标：worker 内访问
+      // items[undefined] 会抛 TypeError，pool 把它记成 results[i]={__err} 多出一个「幽灵第 N+1 题」。
+      // 旧版靠终检 validateQuestion 过滤掉它；但 v12 的节流时序让幽灵更易命中「本地硬校验→重写」
+      // 通道——重写 mock/真实 AI 返回合法题时会把它洗成合法题混进最终卷（题量 6→7）。
+      // 取号后立即边界守卫，越界直接归还（不消耗 done/不回调）。
+      if (i >= items.length) break;
       try { results[i] = await worker(items[i], i); }
       catch (e) {
         if (e && e.name === 'CancelError') { results[i] = { __canceled: true }; break; }
@@ -696,6 +770,7 @@ async function handleTermination(sig) {
   if (_sigHandled) return;
   _sigHandled = true;
   log('!! 收到 ' + sig + '：执行器将被终止（Actions 超时或手动取消），尽力回写终态…');
+  dropPendingStatus();   // 丢弃节流攒着的待发 running，避免 8s 后迟到 PATCH 覆盖下面的 error 终态
   // 被杀的宽限期只有几秒：直写不走 ghRetry（限额长退避会白等几分钟，等来 SIGKILL）
   const payload = { files: {
     'status.json': { content: JSON.stringify({ status: 'error', stage: '', msg: '⚠ 执行器被强制终止（' + sig + '：Actions 超时或手动取消）· 已出 ' + _partialCount + ' 题已落盘 partial.json，可点「🆘 抢救已出题目」收卷', progress: null, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
@@ -934,7 +1009,8 @@ async function runImport(gist, job, prefs) {
       builtBy: 'pdf-import', generatedAt: new Date().toISOString()
     };
     pushLog('✅ 识别完成：' + uniq.length + ' 题 · 待人工复核 ' + lowN + ' 题' + (failedGroups.length ? ' · 失败页组 ' + failedGroups.length : ''));
-    await flushPartial(uniq, { subject: subj, imported: true });
+    await flushPartial(uniq, { subject: subj, imported: true, force: true });
+    dropPendingStatus();
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
       'result.json': { content: JSON.stringify(exam) },
       'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📄 识别完成（' + uniq.length + ' 题 · 待复核 ' + lowN + '），可收卷导入预览确认', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, imported: true, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
@@ -1096,7 +1172,8 @@ async function runImport(gist, job, prefs) {
       if (ci && ci.canceled) throw new CancelError('cancel');
       QS[i].st = 'run';
       QS[i].t0 = Date.now();
-      await setStatus('running', 'generating', '并发出题中… ' + genDone + '/' + genTotal, 10 + Math.round(genDone / genTotal * 45));
+      // 【2026-09-03 配额治理】开工不再单独 setStatus：QS[i].st='run' 会随「上一题完成」或
+      // 「本题完成」的节流窗口合并写入，浮窗逐题卡片仍会更新，省掉每题一次的冗余 PATCH。
       const out = await aiToolJson(
         [{ role: 'system', content: questionSystem(subj) },
          { role: 'user', content: '蓝图第' + (i + 1) + '题：' + JSON.stringify(pq) }],
@@ -1177,7 +1254,11 @@ async function runImport(gist, job, prefs) {
             [{ role: 'system', content: questionSystem(subj) },
              { role: 'user', content: '重写这道题（原题如下）。' + feedback + '\n原题：' + JSON.stringify(old) }],
             {});
-          cand.topicName = old.topicName; cand.score = old.score; cand.type = old.type || cand.type;
+          // 旧题可能是 worker 失败占位（{__err}），topicName/score 会丢——回退到蓝图原题参数
+          const pq0 = plan.questions[i];
+          cand.topicName = old.topicName || (pq0 && pq0.topicName) || '';
+          cand.score = old.score || (pq0 && pq0.score) || 5;
+          cand.type = old.type || (pq0 && pq0.type) || cand.type;
           const bad = validateQuestion(cand);
           if (!bad) { fixed = cand; break; }
           lastBad = bad;
@@ -1217,13 +1298,17 @@ async function runImport(gist, job, prefs) {
     // 先落盘终稿再写 result.json：这一步是整条链路的最后一跳、文件最大、最容易失败
     // （Gist 限额/网络/权限都可能在这一刻报错），落盘后即使它挂了，
     // 客户端也能从 partial.json 抢救出「已过总工审查的完整卷」，而不是退回初稿。
-    await flushPartial(questions, { reviewed: true, subject: subj });
+    await flushPartial(questions, { reviewed: true, subject: subj, force: true });
+    dropPendingStatus();
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
       'result.json': { content: JSON.stringify(exam) },
       'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
     } });
     log('✅ 完成');
   } catch (e) {
+    // 进入终态处理（取消/失败）：先丢弃节流攒着的待发 running，否则它会在下面
+    // 直写 canceled/error 之后迟到触发，把终态覆盖回 running（客户端永远看到「进行中」）。
+    dropPendingStatus();
     // 取消路径：用户主动停止 → 按 savePartial 决定是否把已出合格题打包成 partial 卷
     if (e && e.name === 'CancelError') {
       const wantSave = !(e.message === 'user-cancel-no-save');
@@ -1232,7 +1317,7 @@ async function runImport(gist, job, prefs) {
         if (wantSave && cands.length) {
           // 取消路径也补一次落盘：把「最后一次 flush 之后才完成」的题补进 partial.json，
           // 保证 result.json 与 partial.json 内容一致（客户端优先用前者，后者作兜底）。
-          await flushPartial(cands);
+          await flushPartial(cands, { force: true });
           const partial = {
             title: '☁️ 云端押题卷（部分 · ' + cands.length + ' 题）',
             subject: (function () {
@@ -1267,7 +1352,7 @@ async function runImport(gist, job, prefs) {
     // 这是本次重构的核心场景——执行器失败退出后，本地仍能从 partial.json 捞回已出的题，
     // 而不是像旧实现那样「进程一死，题目全没，本地点多少次保存都没用」。
     // SAVED 定义在 try 块之外，catch 里可安全引用（gist/subj 是 try 内 const，不可引用）。
-    try { await flushPartial(SAVED); } catch (e0) { log('!! 失败前抢救落盘异常：', e0.message); }
+    try { await flushPartial(SAVED, { force: true }); } catch (e0) { log('!! 失败前抢救落盘异常：', e0.message); }
     // 【H5】先把完整日志单独落盘，再写 error 状态：
     // 万一写 status 这一步也失败，日志已经在 log.json 里，客户端仍能看到「AI 在哪一步挂的」。
     pushLog('❌ 执行失败：' + String((e && e.message) || e).slice(0, 200), 'error');
