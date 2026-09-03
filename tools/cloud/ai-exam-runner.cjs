@@ -661,7 +661,7 @@ function bpStructureDesc(bp) {
 function bpTotalScore(bp) { return Number(bp && bp.totalScore) || 150; }
 function bpTimeLimit(bp) { return Number(bp && bp.timeLimit) || 180; }
 
-// 蓝本预设（与 js/core/exam-pipeline.js 保持同步）
+// 蓝图预设（与 js/core/exam-pipeline.js 保持同步）
 const DEFAULT_BP = {
   shuyi: { name: '数学一（真题卷型）', subject: 'math', totalScore: 150, timeLimit: 180, types: [{ type: 'choice', count: 10, score: 5 }, { type: 'fill', count: 6, score: 5 }, { type: 'solve', count: 6, score: 0 }], starMix: { 1: 0, 2: 15, 3: 45, 4: 30, 5: 10 } },
   ctrl: { name: '专业课（6 道综合大题）', subject: 'ctrl', totalScore: 150, timeLimit: 180, types: [{ type: 'solve', count: 6, score: 25 }], starMix: { 1: 0, 2: 0, 3: 35, 4: 45, 5: 20 } },
@@ -670,6 +670,81 @@ const DEFAULT_BP = {
   ying2: { name: '英语二', subject: 'eng', totalScore: 100, timeLimit: 180, types: [{ type: 'fill', count: 10, score: 1 }, { type: 'choice', count: 15, score: 2 }, { type: 'essay', count: 2, score: 15 }, { type: 'solve', count: 1, score: 0 }], starMix: { 1: 8, 2: 22, 3: 40, 4: 25, 5: 5 } }
 };
 const SUBJ_TO_PRESET = { math: 'shuyi', ctrl: 'ctrl', eng: 'yingyi', pol: 'pol' };
+
+// 【2026-09-03 链路加固】从蓝图反推每道题的 score —— 不再相信出题 AI 自报 score。
+// 出题 schema 里没有 score 字段，AI 会自由发挥（常全 5）；必须由 blueprint.types[].score 决定性覆盖。
+// 旧版兜底 "|| 5" 是分值失真总根源（22 题 × 5 = 110 ≠ bp.totalScore 150，趋势图分母/成绩单档位全错）。
+function scoreForType(bp, qtype) {
+  var types = (bp && bp.types) || [];
+  var t = types.find(function (x) { return x && x.type === qtype; });
+  if (!t) return 5;   // 蓝图未规定（如 essay 0 分）→ 兜底 5
+  return Number(t.score) || 0;
+}
+// 把"每题 score 应分"转成自然语言描述注入 plannerSystem，让 AI 在规划阶段就把 score 写齐（方便审查对照）。
+function scoreSpecText(bp) {
+  var types = (bp && bp.types) || [];
+  return types.map(function (t) { return (t.score || 0) + '分/' + (t.type || '?') + '×' + t.count + '道'; }).join('，');
+}
+// 把"bp.starMix 比例"转成"目标数量"：例如 {1:0,2:15,3:45,4:30,5:10} + 22 题 → ★2×3 / ★3×10 / ★4×7 / ★5×2
+// 出题完成后若分布明显偏离（±2 道以上）做一次 forceStarMix 再平衡，star 字段不再是 AI 自由发挥。
+function starMixTargets(bp, n) {
+  var mix = (bp && bp.starMix) || {};
+  var targets = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  var assigned = 0;
+  [1, 2, 3, 4, 5].forEach(function (s) {
+    var c = Math.round((mix[s] || 0) / 100 * n);
+    targets[s] = c; assigned += c;
+  });
+  // 舍入误差：把差值贴到占比最大的档
+  var diff = n - assigned;
+  if (diff !== 0) {
+    var topS = [3, 4, 2, 5, 1].sort(function (a, b) { return (mix[b] || 0) - (mix[a] || 0); })[0];
+    targets[topS] = Math.max(0, targets[topS] + diff);
+  }
+  return targets;
+}
+// 根据目标分布，把当前 questions 数组按 star 重新平衡：只在分布差异 ≥2 道时才动手（避免无谓改写）。
+function forceStarMix(questions, bp) {
+  var n = questions.length;
+  if (!n) return { changed: 0, distribution: {} };
+  var targets = starMixTargets(bp, n);
+  // 统计当前各 star 的题数
+  var counts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  questions.forEach(function (q) {
+    var s = clampStar(q.star);
+    counts[s] = (counts[s] || 0) + 1;
+  });
+  var changed = 0;
+  // 多于目标的 star → 把多出来的题的 star 降到目标数最少的 star（保持题内容不变）
+  [5, 4, 3, 2, 1].forEach(function (s) {
+    var over = counts[s] - (targets[s] || 0);
+    if (over <= 0) return;
+    var deficitStars = [];
+    [1, 2, 3, 4, 5].forEach(function (t) { if ((counts[t] || 0) < (targets[t] || 0)) deficitStars.push(t); });
+    if (!deficitStars.length) return;
+    var moved = 0;
+    for (var i = 0; i < questions.length && moved < over; i++) {
+      var q = questions[i];
+      if (clampStar(q.star) !== s) continue;
+      //  选当前缺口最大的目标 star
+      var pickT = deficitStars.sort(function (a, b) { return (targets[b] - counts[b]) - (targets[a] - counts[a]); })[0];
+      q.star = pickT;
+      counts[s]--; counts[pickT] = (counts[pickT] || 0) + 1;
+      changed++; moved++;
+    }
+  });
+  return { changed: changed, distribution: counts, targets: targets };
+}
+function clampStar(v) {
+  var n = Math.floor(Number(v));
+  if (n >= 1 && n <= 5) return n;
+  return 3;   // AI 不给或乱给 → 兜底 ★3（中档），避免渲染 ★?
+}
+// chiefSystem 的 targetHardPct 不再硬编码 40，按 bp.starMix 实际 ★4+★5 占比算
+function targetHardPct(bp) {
+  var mix = (bp && bp.starMix) || {};
+  return Math.round(((mix[4] || 0) + (mix[5] || 0)));
+}
 
 // 题量档缩放（与本地 sprint.js 的 volumeBp 同规则，保证云/地两端题量口径一致）：
 // lite：选择/填空减半、解答/写作保留，限时 ×0.7；full：全题型 ×1.5，限时 ×1.25。纯函数、不原地改蓝图。
@@ -708,20 +783,45 @@ function plannerSystem(subj, prefs) {
   const structure = bpStructureDesc(bp);
   const totalScore = bpTotalScore(bp);
   const timeLimit = bpTimeLimit(bp);
+  // 【2026-09-03】把 starMix 配比 + score 分值硬约束 + avoidHint 注入 prompt——出题 AI 不再自由发挥。
+  const starMixSpec = Object.keys((bp && bp.starMix) || {})
+    .filter(function (s) { return (bp.starMix[s] || 0) > 0; })
+    .map(function (s) { return '★' + s + ' ' + bp.starMix[s] + '%'; })
+    .join('，');
+  const scoreSpec = scoreSpecText(bp);
+  const historyTopics = Array.isArray(prefs.historyTopics) ? prefs.historyTopics : [];
+  const avoidHint = historyTopics.length
+    ? '\n【避重·硬约束】以下考点与角度在最近卷已考过：' + historyTopics.slice(0, 30).map(function (t) { return String(t).slice(0, 50); }).join(' / ')
+      + '——**严禁原样复刻**（可考同模块的不同考点，或换设问角度）。'
+    : '';
   return '你是考研' + subjName(subj) + '命题总工程师。请按给定蓝本规划一份押题卷。'
     + '\n【蓝本】' + (bp.name || '押题卷') + '：' + structure + '，共 ' + n + ' 题，总分 ' + totalScore + '，限时 ' + timeLimit + ' 分钟。'
+    + '\n【难度配比硬约束】' + starMixSpec + '——每题 star 严格按此分布（★1-2 基础 / ★3 中档 / ★4-5 压轴）。'
+    + '\n【分值硬分配】每题 score = ' + scoreSpec + '；规划阶段把每题 score 直接写入（与蓝本严格一致）。'
     + '\n【难度】' + diffNote
+    + avoidHint
     + '\n要求：①覆盖不同考点，突出今年高频与考生薄弱方向 ②题型分布严格符合蓝本结构 ③每题给出方向描述供出题 AI 执行。\n'
-    + '只输出 JSON：{"title":"卷名","timeLimit":' + timeLimit + ',"questions":[{"topicName":"考点","type":"choice|fill|solve|essay","direction":"命题方向一句话"}]}';
+    + '只输出 JSON：{"title":"卷名","timeLimit":' + timeLimit + ',"questions":[{"topicName":"考点","type":"choice|fill|solve|essay","direction":"命题方向一句话","star":1-5,"score":按分值硬分配}]}';
 }
 function questionSystem(subj) {
   return '你是考研' + subjName(subj) + '命题专家。按给定蓝图出一道题：题目创新但解法严格在考纲内；题干严谨无歧义；选择题给 4 个选项（A. B. C. D. 开头）；答案必须正确——输出前自己把解答完整走一遍（能算的数值都算实），确保答案与解析逐步一致。\n'
     + '【解析完整性·硬要求】solution 必须"分步推导→结论→易错点"三段式完整；solve/essay 题解析 ≥60 字、choice 题 ≥25 字、fill 题 ≥20 字；禁止只写最终答案或一句话带过。\n'
+    + '【字段必填】star（1-5 整数，按蓝图分配，不要自由发挥）+ diff（easy|medium|hard，按 star 派生：★1-2→easy，★3→medium，★4-5→hard）。\n'
     + '只输出 JSON：{"stem":"题干(LaTeX用$...$)","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."]或省略,"answer":"正确答案","solution":"详细解析","trap":"常见陷阱一句话","diff":"easy|medium|hard","star":1-5}';
 }
-function chiefSystem(subj) {
-  return '你是考研' + subjName(subj) + '押题卷总审查工程师。逐题检查：①解析是否完整（是否分步推导+结论+易错点、是否满足 solve/essay≥60字·choice≥25字·fill≥20字的下限——看的是**完整解析**，不是片段）②答案是否正确（工具开启时优先用 python_exec 真实验算关键步骤，不要心算）③题干是否严谨无歧义 ④选项是否有双对/无解 ⑤难度星级是否虚标。verdict 判定：全过关 ok；≤2 题小问题 minor；更多或整卷性问题 major。\n'
-    + '只输出 JSON：{"verdict":"ok|minor|major","targetHardPct":40,"hardPct":实际hard百分比,"summary":"总评一句话","needsRewrite":[{"index":题号从1开始,"reason":"问题","fixHint":"修改指引"}]}';
+function chiefSystem(subj, bp) {
+  // 【2026-09-03】接收 bp → targetHardPct 从硬编码 40 改为按 bp.starMix 实际 ★4+★5 占比算（数学一 40 / 专业课 65 / 政治 20 / 英语一 30 / 英语二 30）；
+  // 同时要求审查时核对题分是否对齐蓝图。
+  var tHP = targetHardPct(bp);
+  var scoreSpec = scoreSpecText(bp);
+  return '你是考研' + subjName(subj) + '押题卷总审查工程师。逐题检查：'
+    + '①解析是否完整（是否分步推导+结论+易错点、是否满足 solve/essay≥60字·choice≥25字·fill≥20字的下限——看的是**完整解析**，不是片段）'
+    + '②答案是否正确（工具开启时优先用 python_exec 真实验算关键步骤，不要心算）'
+    + '③题干是否严谨无歧义 ④选项是否有双对/无解 ⑤难度星级 star 是否虚标（★1-2 基础 / ★3 中档 / ★4-5 压轴）'
+    + '⑥【新增】题目方向 direction 是否与考点 topicName 一致 ⑦【新增】题分 score 是否与蓝图分值硬分配一致（蓝图：' + scoreSpec + '）。\n'
+    + 'verdict 判定：全过关 ok；≤2 题小问题 minor；更多或整卷性问题 major。'
+    + 'targetHardPct（按蓝本 ★4+★5 占比）：' + tHP + '。\n'
+    + '只输出 JSON：{"verdict":"ok|minor|major","targetHardPct":' + tHP + ',"hardPct":实际hard百分比,"summary":"总评一句话","needsRewrite":[{"index":题号从1开始（必须在 1..' + (bpQuestionCount(bp)) + ' 范围内）, "reason":"问题","fixHint":"修改指引"}]}';
 }
 
 // ---------- 本地蓝本硬校验（纯代码，零幻觉防线） ----------
@@ -1128,6 +1228,9 @@ async function runImport(gist, job, prefs) {
 
     // ② 总工规划
     const isResume = resuming && resumeQs.length > 0;
+    // 【2026-09-03】把生效蓝图提到主流程作用域：worker / chief / 终检都要用到 bp.starMix 与 bp.types
+    // （不再在 plannerSystem 里局部声明，避免 worker/chief 引用不到）。
+    const bp = resolveBpFromPrefs(subj, prefs);
     await setStatus('running', 'planning', isResume ? ('续跑规划中…（已有 ' + resumeQs.length + ' 题，补 ' + resumeNeed + ' 题）') : '总工程师正在规划蓝图…', 5);
     let plan;
     if (isResume && resumeNeed <= 0) {
@@ -1152,16 +1255,24 @@ async function runImport(gist, job, prefs) {
     // 续跑且题已够时 questions 允许为空；其余情况空蓝图就是失败
     if (!plan || !Array.isArray(plan.questions)) throw new Error('蓝图规划失败：返回格式不对');
     if (!plan.questions.length && !(isResume && resumeNeed <= 0)) throw new Error('蓝图规划失败：无 questions');
-    log('蓝图完成：', plan.questions.length, '题 ·', plan.title || '');
-    pushLog('🗺 蓝图《' + (plan.title || '未命名卷') + '》规划完成：共 ' + plan.questions.length + ' 题 · 限时 ' + (plan.timeLimit || 120) + ' 分钟');
-    plan.questions.forEach((pq, i) => pushLog('　第' + (i + 1) + '题 ' + (pq.topicName || '?') + ' · ' + (pq.type || '?') + ' · ★' + (pq.star || '?')));
+    // 【2026-09-03 链路加固】蓝图落地时按 bp 决定性覆盖 score + star，AI 自由发挥不再生效。
+    // 1) score 用 scoreForType(bp, type) 反查（避免 AI 全填 5）；2) star 用 clampStar 兜底（避免 ?）;
+    // 3) starMixTargets/bp 决定每题目标档 → 超过 ±2 道差异再 forceStarMix 再平衡。
+    plan.questions.forEach(function (pq, i) {
+      pq.score = scoreForType(bp, pq.type);
+      pq.star = clampStar(pq.star);
+    });
+    var planStarMix = forceStarMix(plan.questions, bp);
+    log('蓝图完成：', plan.questions.length, '题 ·', plan.title || '', '· star 分布=', JSON.stringify(planStarMix.distribution));
+    pushLog('🗺 蓝图《' + (plan.title || '未命名卷') + '》规划完成：共 ' + plan.questions.length + ' 题 · 限时 ' + (plan.timeLimit || 120) + ' 分钟 · ★分布 ' + JSON.stringify(planStarMix.distribution));
+    plan.questions.forEach((pq, i) => pushLog('　第' + (i + 1) + '题 ' + (pq.topicName || '?') + ' · ' + (pq.type || '?') + ' · ★' + (pq.star || '?') + ' · ' + (pq.score || 0) + '分'));
     // 初始化逐题状态墙（浮窗卡片数据源）
     // 续跑时先为「上次已落盘的题」占位（st=done + resumed 标记），浮窗一眼能看出哪些是接着出的
     if (isResume) {
-      resumeQs.forEach((q, i) => QS.push({ i: i + 1, topic: String(q.topicName || '?').slice(0, 30), star: q.star || '?', type: q.type || '?', score: q.score || 5,
+      resumeQs.forEach((q, i) => QS.push({ i: i + 1, topic: String(q.topicName || '?').slice(0, 30), star: clampStar(q.star), type: q.type || '?', score: Number(q.score) || 5,
         st: 'done', resumed: true, stem: String(q.stem || '').slice(0, 140), ans: String(q.answer || '').slice(0, 60) }));
     }
-    plan.questions.forEach((pq, i) => QS.push({ i: resumeQs.length + i + 1, topic: String(pq.topicName || '?').slice(0, 30), star: pq.star || '?', type: pq.type || '?', score: pq.score || 5, st: 'wait' }));
+    plan.questions.forEach((pq, i) => QS.push({ i: resumeQs.length + i + 1, topic: String(pq.topicName || '?').slice(0, 30), star: pq.star, type: pq.type || '?', score: pq.score || 5, st: 'wait' }));
     await setStatus('running', 'generating', '并发出题中… 0/' + plan.questions.length, 10);
 
     // ③ 并发出题池
@@ -1179,8 +1290,12 @@ async function runImport(gist, job, prefs) {
          { role: 'user', content: '蓝图第' + (i + 1) + '题：' + JSON.stringify(pq) }],
         {});
       out.topicName = pq.topicName || out.topicName || '';
-      out.score = out.score || pq.score || 5;
+      // 【2026-09-03】出题 AI 经常乱填 score → 一律按蓝图 scoreForType 决定性覆盖；
+      // diff 字段也按 clampStar 反推，避免与 star 自相矛盾。
+      out.score = scoreForType(bp, out.type || pq.type);
       out.type = pq.type || out.type || 'solve';
+      out.star = clampStar(out.star);
+      out.diff = ({ 1: 'easy', 2: 'easy', 3: 'medium', 4: 'hard', 5: 'hard' })[out.star] || 'medium';
       if (!validateQuestion(out)) {
         QS[i].st = 'done';
         QS[i].sec = Math.round((Date.now() - QS[i].t0) / 1000);
@@ -1219,15 +1334,31 @@ async function runImport(gist, job, prefs) {
     // ⑤ 总工审查
     await setStatus('running', 'reviewing', '总工程师审查中…', 58);
     let review = {};
+    let reviewFailed = false;
     try {
       review = await aiToolJson(
-        [{ role: 'system', content: chiefSystem(subj) },
-         { role: 'user', content: '审查这份押题卷（题号从1开始）：\n' + JSON.stringify(questions.map((q, i) => ({ index: i + 1, stem: q.stem, options: q.options, answer: q.answer, solution: String(q.solution || ''), star: q.star })) ) }],
+        [{ role: 'system', content: chiefSystem(subj, bp) },
+         { role: 'user', content: '审查这份押题卷（题号从1开始，共 ' + questions.length + ' 题）：\n' + JSON.stringify(questions.map((q, i) => ({
+           index: i + 1, stem: q.stem, options: q.options, answer: q.answer,
+           solution: String(q.solution || ''), star: q.star, diff: q.diff, score: q.score,
+           topicName: q.topicName, type: q.type, direction: plan.questions[i] && plan.questions[i].direction
+         })) ) }],
         {});
-    } catch (e) { log('审查调用失败，仅按本地校验处理：', e.message); }
+    } catch (e) {
+      reviewFailed = true;
+      log('审查调用失败，仅按本地校验处理：', e.message);
+      pushLog('⚠️ 总审查调用失败（' + String((e && e.message) || '').slice(0, 60) + '），降级为本地校验通过', 'warn');
+    }
     const rewriteList = [];
     const seenRw = {};
-    ((review.needsRewrite) || []).forEach(r => { if (r && r.index && !seenRw[r.index]) { seenRw[r.index] = 1; rewriteList.push(r); } });
+    // 【2026-09-03】needsRewrite 的 index 必须落在 1..questions.length 范围内（之前不校验，
+    // AI 可能写 0 或超大下标 → 后续 questions[i] = undefined → 重写池空跑或越界）。
+    ((review.needsRewrite) || []).forEach(r => {
+      if (!r || !r.index) return;
+      var idx = parseInt(r.index, 10);
+      if (!(idx >= 1 && idx <= questions.length)) { log('审查 needsRewrite.index 越界：', r.index); return; }
+      if (!seenRw[idx]) { seenRw[idx] = 1; rewriteList.push(r); }
+    });
     localIssues.forEach(li => { if (!seenRw[li.index]) { seenRw[li.index] = 1; rewriteList.push(li); } });
     log('审查 verdict=', review.verdict || 'n/a', '待重写', rewriteList.length, '题');
     pushLog('🧐 总审查 verdict=' + (review.verdict || 'n/a') + (review.summary ? '（' + String(review.summary).slice(0, 60) + '）' : '') + '，待重写 ' + rewriteList.length + ' 题');
@@ -1257,8 +1388,11 @@ async function runImport(gist, job, prefs) {
           // 旧题可能是 worker 失败占位（{__err}），topicName/score 会丢——回退到蓝图原题参数
           const pq0 = plan.questions[i];
           cand.topicName = old.topicName || (pq0 && pq0.topicName) || '';
-          cand.score = old.score || (pq0 && pq0.score) || 5;
+          // 【2026-09-03】重写也按蓝图决定性覆盖 score（避免 AI 在重写 prompt 里再填 5）
+          cand.score = scoreForType(bp, cand.type || (pq0 && pq0.type) || old.type);
           cand.type = old.type || (pq0 && pq0.type) || cand.type;
+          cand.star = clampStar(cand.star);
+          cand.diff = ({ 1: 'easy', 2: 'easy', 3: 'medium', 4: 'hard', 5: 'hard' })[cand.star] || 'medium';
           const bad = validateQuestion(cand);
           if (!bad) { fixed = cand; break; }
           lastBad = bad;
@@ -1281,14 +1415,32 @@ async function runImport(gist, job, prefs) {
     // 剔除个别终检仍坏的题（宁缺毋滥），至少保留 60%
     questions = questions.filter(q => !validateQuestion(q));
     if (questions.length < 5) throw new Error('合格题不足 5 题，放弃交付');
-    const totalScore = questions.reduce((a, q) => a + (Number(q.score) || 5), 0);
+    // 【2026-09-03】重写后 / 终检后做一次 forceStarMix（防止 AI 自由发挥让 ★4+★5 远超 bp.starMix）
+    var finalMix = forceStarMix(questions, bp);
+    if (finalMix.changed > 0) pushLog('🎯 终检再平衡 star 配比：调整 ' + finalMix.changed + ' 题 → ' + JSON.stringify(finalMix.distribution));
+    // 【2026-09-03】总分对齐：Σ q.score 必须 = bp.totalScore（除不尽的零头贴最后一题）。
+    // 出题阶段已按 scoreForType 决定性覆盖，理论已对齐；此处兜底防止某个 review/chief 误改了 score。
+    var bpTotal = bpTotalScore(bp);
+    var sumScore = questions.reduce(function (a, q) { return a + (Number(q.score) || 0); }, 0);
+    if (Math.abs(sumScore - bpTotal) > 0.01 && questions.length) {
+      var drift = +(bpTotal - sumScore).toFixed(2);
+      questions[questions.length - 1].score = +((Number(questions[questions.length - 1].score) || 0) + drift).toFixed(2);
+      sumScore = questions.reduce(function (a, q) { return a + (Number(q.score) || 0); }, 0);
+      pushLog('⚖️ 总分对齐：原 Σ ' + sumScore.toFixed(0) + ' → 强制贴齐蓝图 ' + bpTotal + '（最后一题吸收 ' + drift + ' 分）');
+    }
+    const totalScore = sumScore;
     const exam = {
       title: plan.title || ('云端押题卷 · ' + (SUBJ_NAME[subj] || '')),
       subject: subj,
       timeLimit: plan.timeLimit || 120,
       totalScore: totalScore,
       questions: questions,
-      chiefReview: { verdict: review.verdict || (rewriteList.length ? 'minor' : 'ok'), hardPct: review.hardPct || null, targetHardPct: review.targetHardPct || null, summary: review.summary || '', rewrittenCount: rewriteList.length },
+      // 【2026-09-03】审查异常时不再默 ok（之前 reviewFailed=true 时 chiefReview.verdict 走 fallback 仍写 ok → 用户误以为"已过审"）；
+      // 降级为 'unknown' 让前端明示"AI 审查未响应，本地校验通过"
+      chiefReview: { verdict: reviewFailed ? 'unknown' : (review.verdict || (rewriteList.length ? 'minor' : 'ok')),
+        hardPct: review.hardPct || null, targetHardPct: targetHardPct(bp),
+        summary: review.summary || (reviewFailed ? 'AI 审查未响应，已按本地校验通过' : ''),
+        rewrittenCount: rewriteList.length, reviewFailed: reviewFailed },
       builtBy: 'cloud-actions',
       generatedAt: new Date().toISOString()
     };
