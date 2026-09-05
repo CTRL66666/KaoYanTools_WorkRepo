@@ -131,7 +131,7 @@ async function readSourceBuffer(files, tag) {
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-const RUNNER_VER = 'v13';
+const RUNNER_VER = 'v14';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -997,6 +997,43 @@ process.on('SIGINT', () => handleTermination('SIGINT'));
  * 客户端收卷后走「预览确认」人工修订，未经人工过目的导入不当成品用。 */
 const IMG_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
 function extOf(name) { const m = String(name || '').toLowerCase().match(/\.(\w+)$/); return m ? m[1] : ''; }
+
+// 【v14 乱码文字层判定】有些 PDF 用无 ToUnicode 映射的子集字体（CID 编码）：本地阅读器
+// 按内嵌字形直接画「看起来正常」，但 pdftotext 提取出来是「狶狶狶」碎片乱码。
+// 旧防御只看字符数 ≥240，乱码页照样放行文本通道 → AI 收到噪声直接拒答（"输出中没有 JSON"）。
+// 三重启发式（任一命中即乱码）：
+//   ① 非常用字符占比 >0.45（CJK 扩展区/兼容区生僻字——注意 CID 乱码也常用 U+4E00 区的生僻字，
+//      所以光靠①不够，见②③）
+//   ② 长度 ≥3 的连续同字符覆盖 >50%（「狶狶狶狶犥犥犥」式碎片重复）
+//   ③ 单一字符占比 >25%（真中文页 top 字频一般 <8%；乱码/点线页 top 字频暴增）
+// 常用字符白名单：CJK 基本区 U+4E00-9FA5 + 假名 + ASCII + CJK 标点 + 全角（一律用 \u 转义写，
+// 防止字面汉字区间被工具链编码破坏——曾发生「一-龥」变成「㐀-䶿」致全部正常中文误判乱码）
+const COMMON_CJK_RE = /[\u4e00-\u9fa5\u3040-\u30ffA-Za-z0-9\u3000-\u303f\uff00-\uffef]/;
+function garbledRatio(txt) {
+  // Array.from 按码点拆分：代理对（CJK 扩展区 𠀋/𪚥 等）算 1 字符——若用 s.length（UTF-16 计数）
+  // 会让这类字符的分母翻倍、rare 占比被稀释一半，导致扩展区乱码漏判。
+  const arr = Array.from(String(txt || '').replace(/\s+/g, ''));
+  const n = arr.length;
+  if (n < 30) return 0;
+  let rare = 0, topCnt = 0;
+  const cnt = {};
+  let runCover = 0, prev = '', run = 0;
+  // run≥4 的连续同字符计入「重复覆盖」：正常中文/英文几乎不会出现 4 连同字；
+  // CID 乱码（狶狶狶狶）与填空点线（＿＿＿＿）都会命中——前者是噪声该转视觉，
+  // 后者视觉同样能读，转过去无害。阈值取 4 而非 3，避开「看看」「谢谢」类自然叠字。
+  const flushRun = () => { if (run >= 4) runCover += run; };
+  for (const ch of arr) {
+    if (COMMON_CJK_RE.test(ch) === false) rare++;
+    cnt[ch] = (cnt[ch] || 0) + 1;
+    if (cnt[ch] > topCnt) topCnt = cnt[ch];
+    if (ch === prev) run++; else { flushRun(); prev = ch; run = 1; }
+  }
+  flushRun();
+  return Math.max(rare / n, runCover / n, topCnt / n * 0.9);
+}
+// 一页文字层 → 该页转视觉；阈值 0.45：真页（中英混排/公式）rare<0.3、cover≈0、top 字频贡献 <0.12
+// 均远低于阈值；CID 乱码页（生僻字主导 + 高重复）ratio 通常 >0.6。漏网的由第二层防御兜底。
+function pageIsGarbled(txt) { return garbledRatio(txt) > 0.45; }
 function importTextSystem(subj) {
   return '你是考研' + subjName(subj) + '试卷数字化工程师。用户给你一份试卷其中几页的文字层提取（pdftotext 输出，'
     + '可能含页眉页脚、双栏错序、公式残缺、题目跨页）。任务：把每一道题完整还原成结构化 JSON。'
@@ -1146,30 +1183,58 @@ async function runImport(gist, job, prefs) {
         if (p === 1 || p === pages || p % 5 === 0) await setStatus('running', 'parsing', '🧾 逐页提取文字层 ' + p + '/' + pages + '…', 2 + Math.round(p / pages * 10));
       }
       // 文字密度阈值：pdftotext 压掉空白后 <240 字符判为「扫描页/公式页」，转图走视觉
+      // 【v14 乱码防御】字符数够但乱码率高的页（CID 无 ToUnicode 字体）同样转视觉——
+      //   否则喂文本模型只会得到「AI 已拒绝输出 JSON」。
       const TEXT_MIN = 240;
       let tGroup = [];
-      const flushT = () => { if (tGroup.length) { groups.push({ kind: 'text', text: tGroup.map(g => g.txt).join('\n\n'), pages: tGroup.map(g => g.p) }); tGroup = []; } };
+      const flushT = () => {
+        if (!tGroup.length) return;
+        const gp = tGroup.map(g => g.p);
+        groups.push({
+          kind: 'text', text: tGroup.map(g => g.txt).join('\n\n'), pages: gp,
+          // 【v14 第二层防御】文本通道被 AI 拒答时的视觉重试闭包（renderPageImgs 声明提升，调用时才用）
+          visionRetry: async function () {
+            const out = [];
+            for (let i = 0; i < gp.length; i += 2) {
+              const chunk = gp.slice(i, i + 2);
+              const pngs = await renderPageImgs(chunk);
+              if (pngs.length) out.push({ imgs: pngs, pages: chunk });
+            }
+            return out;
+          }
+        });
+        tGroup = [];
+      };
       const imgPages = [];
+      let garbledN = 0;
       for (let p = 1; p <= pages; p++) {
         const flat = String(pgTxt[p] || '').replace(/\s+/g, '').trim();
-        if (flat.length >= TEXT_MIN) tGroup.push({ p: p, txt: pgTxt[p] });
+        const garbled = flat.length >= TEXT_MIN && pageIsGarbled(pgTxt[p]);
+        if (garbled) garbledN++;
+        if (flat.length >= TEXT_MIN && !garbled) tGroup.push({ p: p, txt: pgTxt[p] });
         else { flushT(); imgPages.push(p); }
       }
       flushT();
-      if (imgPages.length) pushLog('👁 文字层不足 ' + TEXT_MIN + ' 字符的页：' + imgPages.join(',') + '（转 150dpi 图片走视觉识别）');
-      for (let i = 0; i < imgPages.length; i += 2) {
-        const chunk = imgPages.slice(i, i + 2);
-        const pngs = [];
-        for (const p of chunk) {
+      if (garbledN) pushLog('⚠️ 检测到 ' + garbledN + ' 页文字层为乱码（PDF 用无 ToUnicode 的子集字体），已转视觉识别');
+      if (imgPages.length) pushLog('👁 转视觉的页：' + imgPages.join(',') + '（文字层不足 ' + TEXT_MIN + ' 字符或乱码，转 150dpi 图片）');
+      // 【v14】单页渲染 helper：分组转图与「文本组被拒后转视觉重试」共用（150dpi 与 2.6MB 上限口径一致）
+      async function renderPageImgs(pList) {
+        const out = [];
+        for (const p of pList) {
           const base = pathT.join(wd, 'pg' + p);
           const r = await runShell('pdftoppm -f ' + p + ' -l ' + p + ' -png -r 150 ' + JSON.stringify(pdfPath) + ' ' + JSON.stringify(base), 90000);
           if (!r.ok) { pushLog('⚠️ 第 ' + p + ' 页转图失败：' + String(r.err).slice(0, 120), 'warn'); continue; }
           for (const f of fsT.readdirSync(wd).filter(x => x.indexOf('pg' + p) === 0 && /\.png$/.test(x))) {
             const data = fsT.readFileSync(pathT.join(wd, f));
             if (data.length > 2.6 * 1024 * 1024) { pushLog('⚠️ 第 ' + p + ' 页图 ' + Math.round(data.length / 1048576) + 'MB 过大，跳过', 'warn'); continue; }
-            pngs.push('data:image/png;base64,' + data.toString('base64'));
+            out.push('data:image/png;base64,' + data.toString('base64'));
           }
         }
+        return out;
+      }
+      for (let i = 0; i < imgPages.length; i += 2) {
+        const chunk = imgPages.slice(i, i + 2);
+        const pngs = await renderPageImgs(chunk);
         if (pngs.length) groups.push({ kind: 'img', imgs: pngs, pages: chunk });
       }
     }
@@ -1179,7 +1244,8 @@ async function runImport(gist, job, prefs) {
     // ---------- ③ 逐组识别（并发 3，组内按页保序） ----------
     const all = [];
     const failedGroups = [];
-    await pool(groups, 3, async (g) => {
+    // 识别一个组（text/img 两种形态共用）：返回题数；AI 失败抛错由调用方处理
+    async function extractGroup(g) {
       await cancelCheckpoint();
       const userTxt = g.kind === 'text'
         ? '【第 ' + g.pages.join('、') + ' 页 · 文字层提取】\n' + String(g.text).slice(0, 24000)
@@ -1188,14 +1254,7 @@ async function runImport(gist, job, prefs) {
       const msgs = g.kind === 'img'
         ? [{ role: 'system', content: sys }, { role: 'user', content: [{ type: 'text', text: userTxt }].concat(g.imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }]
         : [{ role: 'system', content: sys }, { role: 'user', content: userTxt }];
-      let res;
-      try { res = await aiJson(msgs, { think: false, temperature: 0.1 }); }
-      catch (e) {
-        const m = String((e && e.message) || e);
-        failedGroups.push({ pages: g.pages, err: m.slice(0, 160) });
-        pushLog('⚠️ 第 ' + g.pages.join(',') + ' 页组识别失败：' + m.slice(0, 140), 'warn');
-        return { __err: m };
-      }
+      const res = await aiJson(msgs, { think: false, temperature: 0.1 });
       const rawList = res && Array.isArray(res.questions) ? res.questions : (Array.isArray(res) ? res : []);
       const qs = [];
       for (const raw of rawList) {
@@ -1205,7 +1264,37 @@ async function runImport(gist, job, prefs) {
       // 每组识别完立即落盘 partial.json（含 imported 标记）：中途失败/停止也能抢救已识别题
       await flushPartial(all, { subject: subj, imported: true });
       pushLog('🔎 第 ' + g.pages.join(',') + ' 页（' + g.kind + '）识别出 ' + qs.length + ' 题，累计 ' + all.length + ' 题已落盘');
-      return { n: qs.length };
+      return qs.length;
+    }
+    await pool(groups, 3, async (g) => {
+      try { return { n: await extractGroup(g) }; }
+      catch (e) {
+        const m = String((e && e.message) || e);
+        // 【v14 第二层防御】文字组被 AI 拒答（大概率是漏网的乱码文字层）→ 渲染整页转视觉重试一次。
+        //   判据取反更稳：除明确的传输层错误（HTTP 401/403/408/429/5xx、断网、超时）外全部转视觉——
+        //   解析类失败文案多样（没有 JSON / Unexpected token / 被截断 / 空正文），白名单容易漏。
+        const transportErr = /HTTP 40[138]|HTTP 429|HTTP 5\d\d|Failed to fetch|timeout|超时|ECONN/i.test(m);
+        if (g.kind === 'text' && typeof g.visionRetry === 'function' && !transportErr) {
+          try {
+            pushLog('🔁 第 ' + g.pages.join(',') + ' 页文本通道失败（' + m.slice(0, 60) + '），自动转视觉重试…', 'warn');
+            await setStatus('running', 'extracting', '🔁 第 ' + g.pages.join(',') + ' 页转视觉重试…', 40);
+            const imgGroups = await g.visionRetry();
+            let n2 = 0, lastErr = null;
+            for (const ig of imgGroups) {
+              try { n2 += await extractGroup(Object.assign({ kind: 'img' }, ig)); }
+              catch (e2) { lastErr = e2; pushLog('⚠️ 第 ' + ig.pages.join(',') + ' 页视觉重试仍失败：' + String(e2.message || e2).slice(0, 120), 'warn'); }
+            }
+            if (n2 > 0) return { n: n2, visionRescued: true };
+            failedGroups.push({ pages: g.pages, err: (lastErr && String(lastErr.message || lastErr)) || m });
+            return { __err: m };
+          } catch (e3) {
+            pushLog('⚠️ 第 ' + g.pages.join(',') + ' 页转视觉准备失败：' + String(e3.message || e3).slice(0, 120), 'warn');
+          }
+        }
+        failedGroups.push({ pages: g.pages, err: m.slice(0, 160) });
+        pushLog('⚠️ 第 ' + g.pages.join(',') + ' 页组识别失败：' + m.slice(0, 140), 'warn');
+        return { __err: m };
+      }
     }, (d, n) => setStatus('running', 'extracting', '🔎 AI 拆题中（' + d + '/' + n + ' 组 · 已识出 ' + all.length + ' 题）…', 15 + Math.round(d / n * 65)));
     if (!all.length) {
       throw new Error('所有页面识别失败（共 ' + groups.length + ' 组' + (failedGroups.length ? '：' + failedGroups.map(f => 'P' + f.pages.join('+') + ' ' + f.err).join('；') : '') + '）');
