@@ -131,7 +131,7 @@ async function readSourceBuffer(files, tag) {
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-const RUNNER_VER = 'v12';
+const RUNNER_VER = 'v13';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -490,6 +490,11 @@ async function aiRetry(messages, opts, tries = 3) {
     }
   }
 }
+// 【v13 子母卷】纯文本 AI 调用（带 aiRetry 重试链）：用于「命题形式研究报告」这类
+// 输出为自然语言（非 JSON）的阶段。think 默认跟随 JOB_THINK，由调用方 opts 覆盖。
+async function aiText(messages, opts) {
+  return await aiRetry(messages, Object.assign({ think: JOB_THINK }, opts || {}));
+}
 // 宽容 JSON 抽取：剥 <think> 思考块 → 剥代码围栏 → 找首个平衡的 {...} 或 [...]
 function extractJson(txt) {
   let t = String(txt || '')
@@ -620,6 +625,7 @@ async function cancelCheckpoint() {
 }
 
 // ---------- 并发池 ----------
+// 固定并发版本（保留：非 AI 密集的场景仍可用，如组识别有本地 PDF 渲染瓶颈）
 async function pool(items, conc, worker, onEachDone) {
   const results = new Array(items.length);
   let idx = 0, done = 0;
@@ -647,6 +653,80 @@ async function pool(items, conc, worker, onEachDone) {
   }
   await Promise.all(Array.from({ length: Math.max(1, Math.min(conc, items.length)) }, runOne));
   return results;
+}
+
+// 【T7 v13 智能并发池】对齐本地「快升探测版」调度器并加 429 感知——目标：尽可能压满
+// 接口吞吐、把总出题时长压到最短，同时被限流时自动收敛不烧重试配额。
+//  - 每完成 2 个「快而稳」样本（平均耗时 <30s）→ 并发 +1（慢速成功=API 已饱和排队，不升）
+//  - 任一失败 → 立即 -1；连续 2 失败 → 再 -1 到底（快速避险）
+//  - 429 限流 → 额外降 1 + 置 10s 冷却（冷却期内不升档；aiRetry 自带退避，池只负责不再添乱）
+//  - 空闲 worker 等 120ms 再看新许可（动态扩容时自动被唤醒补位）
+// start=起始并发，max=上限（默认 start*5 封顶 20）；签名与 pool 完全兼容，调用点可平移。
+let RATE_STRIKES = 0;   // 近期 429 计数（跨池共享：出题池撞限流，重写池开局也别太猛）
+let RATE_COOLDOWN_UNTIL = 0;
+function is429Err(e) {
+  const m = (e && e.message) || '';
+  return /HTTP 429|限流|too many|rate.?limit/i.test(m);
+}
+async function smartPool(items, start, worker, onEachDone, opts) {
+  opts = opts || {};
+  const MIN = 1, MAX = Math.max(start, opts.max != null ? opts.max : Math.min(20, start * 5));
+  let cur = Math.min(start, items.length || 1), idx = 0, done = 0;
+  let recent = [], sinceUp = 0, failStreak = 0;
+  const _t0 = Date.now();
+  function observe(ms, ok, err) {
+    if (ok) {
+      recent.push(ms); if (recent.length > 4) recent.shift();
+      failStreak = 0; sinceUp++;
+      if (cur < MAX && sinceUp >= 2 && recent.length >= 2
+          && Date.now() >= RATE_COOLDOWN_UNTIL
+          && recent.reduce(function (a, b) { return a + b; }, 0) / recent.length < 30000) {
+        cur++; sinceUp = 0; recent = [];
+        log('⚡ 并发升档 →', cur);
+      }
+    } else {
+      failStreak++; recent = []; sinceUp = 0;
+      const r429 = !!err && is429Err(err);
+      const before = cur;
+      if (cur > MIN) cur--;
+      if (failStreak >= 2) { cur = Math.max(MIN, cur - 1); failStreak = 0; }
+      if (r429) {
+        RATE_STRIKES++; RATE_COOLDOWN_UNTIL = Date.now() + 10000;
+        if (cur > MIN) cur--;
+        pushLog('🚦 接口限流 429：并发降 ' + before + '→' + cur + '，冷却 10s（已撞限流 ' + RATE_STRIKES + ' 次）', 'warn');
+      } else if (cur < before) {
+        pushLog('⚠️ AI 调用失败：并发降 ' + before + '→' + cur, 'warn');
+      }
+    }
+  }
+  const results_store = new Array(items.length);
+  let inFlight = 0;
+  async function runOne() {
+    while (idx < items.length) {
+      if (inFlight >= cur) { await sleep(120); continue; }   // 活跃数达当前并发：小睡等新许可（cur 升档后自动补位）
+      const ci = await checkCancel();
+      if (ci && ci.canceled) break;
+      const i = idx++;
+      if (i >= items.length) break;                     // 同 pool 的幽灵下标守卫
+      const wt = Date.now();
+      inFlight++;
+      try {
+        results_store[i] = await worker(items[i], i);
+        observe(Date.now() - wt, true, null);
+      } catch (e) {
+        if (e && e.name === 'CancelError') { results_store[i] = { __canceled: true }; break; }
+        results_store[i] = { __err: (e && e.message) || String(e) };
+        observe(Date.now() - wt, false, e);
+        log('worker 失败 @' + i, e.message);
+      } finally { inFlight--; }
+      done++; if (onEachDone) onEachDone(done, items.length);
+      const ci2 = await checkCancel();
+      if (ci2 && ci2.canceled) break;
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(MAX, items.length)) }, runOne));
+  pushLog('⚡ 智能并发结束：峰值 ' + cur + ' 路 · 用时 ' + Math.round((Date.now() - _t0) / 1000) + 's · 完成 ' + done + '/' + items.length);
+  return results_store;
 }
 
 // ---------- 提示词（与 sprint.js 本地管线同风格，独立内联） ----------
@@ -772,7 +852,7 @@ function resolveBpFromPrefs(subj, prefs) {
   return scaleBp(def, prefs && prefs.count);
 }
 
-function plannerSystem(subj, prefs) {
+function plannerSystem(subj, prefs, styleNote) {
   const bp = resolveBpFromPrefs(subj, prefs);
   const diffNote = prefs.diff === 'superhard'
     ? '难度硬约束：全部为压轴难题（★4~★5），禁止基础题。'
@@ -794,14 +874,35 @@ function plannerSystem(subj, prefs) {
     ? '\n【避重·硬约束】以下考点与角度在最近卷已考过：' + historyTopics.slice(0, 30).map(function (t) { return String(t).slice(0, 50); }).join(' / ')
       + '——**严禁原样复刻**（可考同模块的不同考点，或换设问角度）。'
     : '';
+  // 【v13 子母卷】styleNote：母卷命题形式研究报告（derive 模式）。注入后总工按母卷风格规划子卷，
+  //   而非自由押题。非 derive 模式此参数为空，行为与旧版完全一致（零回归）。
+  const styleBlock = styleNote
+    ? '\n【子卷·仿母卷命题形式】本卷是某母卷的子卷，须严格模仿下列命题形式研究报告的'
+      + '题型结构/考点分布逻辑/难度配比/设问风格出题（出新题、换数据换情境，绝不复刻母卷原题）：\n'
+      + styleNote + '\n'
+    : '';
   return '你是考研' + subjName(subj) + '命题总工程师。请按给定蓝本规划一份押题卷。'
     + '\n【蓝本】' + (bp.name || '押题卷') + '：' + structure + '，共 ' + n + ' 题，总分 ' + totalScore + '，限时 ' + timeLimit + ' 分钟。'
     + '\n【难度配比硬约束】' + starMixSpec + '——每题 star 严格按此分布（★1-2 基础 / ★3 中档 / ★4-5 压轴）。'
     + '\n【分值硬分配】每题 score = ' + scoreSpec + '；规划阶段把每题 score 直接写入（与蓝本严格一致）。'
     + '\n【难度】' + diffNote
+    + styleBlock
     + avoidHint
     + '\n要求：①覆盖不同考点，突出今年高频与考生薄弱方向 ②题型分布严格符合蓝本结构 ③每题给出方向描述供出题 AI 执行。\n'
     + '只输出 JSON：{"title":"卷名","timeLimit":' + timeLimit + ',"questions":[{"topicName":"考点","type":"choice|fill|solve|essay","direction":"命题方向一句话","star":1-5,"score":按分值硬分配}]}';
+}
+// 【v13 子母卷】母卷命题形式研究员：读母卷指纹（结构 + 每题选题摘要），产出一份
+//   「命题形式研究报告」文本，注入 plannerSystem 指导子卷规划。与「出题」解耦——
+//   研究员只做归纳（零编造：只依据指纹里给的结构与摘要，不臆测母卷没有的东西）。
+function deriveStyleSystem(subj, prefs) {
+  return '你是考研' + subjName(subj) + '命题形式研究员。给你一张母卷的结构化指纹（题型分布、分值、难度★配比、'
+    + '每题考点与题干摘要）。任务：归纳这张卷子的【命题形式特征】，供后续据此仿出一张同形式的子卷。'
+    + '【铁律】①只做归纳，严禁编造指纹里没有的题号/考点；②聚焦"形式"而非"具体题目内容"——'
+    + '要提炼出可迁移到一套全新题目的规律（如：选择题前 6 题考基础概念辨析、后 4 题考综合应用；'
+    + '大题按章节轮动、每题设置多问递进；计算量分布、陷阱类型偏好等）。'
+    + '只输出一段纯文本研究报告（≤500 字，分点陈述，不要 JSON、不要标题寒暄）：'
+    + '1) 题型与分值结构规律 2) 考点分布逻辑（哪些模块占多少、如何轮动）3) 难度梯度与★配比规律 '
+    + '4) 设问风格（直接求值/证明/辨析/应用情境的占比与套路）5) 仿制子卷时最该复刻的 3 个形式特征。';
 }
 function questionSystem(subj) {
   return '你是考研' + subjName(subj) + '命题专家。按给定蓝图出一道题：题目创新但解法严格在考纲内；题干严谨无歧义；选择题给 4 个选项（A. B. C. D. 开头）；答案必须正确——输出前自己把解答完整走一遍（能算的数值都算实），确保答案与解析逐步一致。\n'
@@ -914,6 +1015,18 @@ function importVisionSystem(subj) {
     + '⑤一道题跨页时在两页都识别完整部分，sourcePages 标该页即可（合并由系统处理）。'
     + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"sourcePages":[1],"confidence":0.95}]}';
 }
+// 【v13 答案解析补全】解答器：给卷面缺答案/解析的题补「AI 参考答案」。
+//   与转录通道解耦——转录铁律「严禁顺手解题」保持不变，补全是独立显式步骤（用户勾选才会跑）。
+//   开思考模式（opts.think=true）提高解题正确率；输出仍走 JSON 便于机器回填。
+function importFillSystem(subj) {
+  return '你是考研' + subjName(subj) + '命题解析专家。用户给你一道试卷原题（卷面没有答案或解析）。'
+    + '任务：把这道题完整解出来，给出参考答案与分步解析。'
+    + '【铁律】①输出前先自己把解答完整走一遍，能算的数值必须算实，确保答案与解析逐步一致；'
+    + '②解析按「思路→分步推导→结论」组织，solve/essay ≥60 字、choice/fill ≥25 字；'
+    + '③若题目信息不全（缺条件/题干有 □ 占位导致无法唯一求解），不要硬编——'
+    + 'answer 与 solution 各写「无法求解：<原因>」并在 unsure 里说明缺什么。'
+    + '只输出 JSON：{"answer":"参考答案（choice 给字母）","solution":"分步解析","unsure":"无法求解的原因或不确定点，确定则空串"}';
+}
 // 导入题结构校验（与出卷题的 validateQuestion 不同：忠实搬运优先，残次不判死只标记）
 function validateImported(q) {
   if (!q || typeof q !== 'object' || !q.stem || String(q.stem).trim().length < 6) return '题干缺失';
@@ -980,8 +1093,22 @@ async function runImport(gist, job, prefs) {
   if (!buf || buf.length < 100) throw new Error('源文件读取为空（来源：' + sourceOrigin + '）——请确认提交时已上传试卷文件，或删除任务重试');
   const isImg = prefs.importKind === 'image';
   pushLog('📄 源文件 ' + Math.round(buf.length / 1024) + ' KB · 类型 ' + (isImg ? '图片' : 'PDF') + ' · ' + (prefs.fileName || '(未命名)') + ' · 来源 ' + sourceOrigin);
-  if (!isImg && !(buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46)) {
-    throw new Error('源文件不是合法 PDF（缺少 %PDF 头）——若是图片请改用图片导入');
+  // 【2026-09-05 v13 修复：非标准 PDF 头】部分扫描件/下载器产物在 %PDF 魔数前混入 BOM 或
+  // 垃圾字节（如 \r\n、HTML 残片），旧版要求 %PDF 严格在 offset 0 → 整单报「不是合法 PDF」。
+  // 现在在前 4KB 内搜索魔数，找到即裁掉头部杂质继续解析；找不到才判非 PDF。
+  if (!isImg) {
+    const isMagic = (o) => buf[o] === 0x25 && buf[o + 1] === 0x50 && buf[o + 2] === 0x44 && buf[o + 3] === 0x46;
+    if (!isMagic(0)) {
+      let found = -1;
+      const scanMax = Math.min(buf.length - 4, 4096);
+      for (let i = 1; i <= scanMax; i++) { if (isMagic(i)) { found = i; break; } }
+      if (found > 0) {
+        pushLog('🔧 非标准 PDF 头：%PDF 位于偏移 ' + found + '（前有 ' + found + ' 字节杂质/BOM），自动裁头后继续解析');
+        buf = buf.subarray(found);
+      } else {
+        throw new Error('源文件不是合法 PDF（前 4KB 内未找到 %PDF 头）——若是图片请改用图片导入');
+      }
+    }
   }
   const wd = pathT.join(osT.tmpdir(), 'cjimp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7));
   fsT.mkdirSync(wd, { recursive: true });
@@ -1097,6 +1224,47 @@ async function runImport(gist, job, prefs) {
     uniq.sort((a, b) => ((a.sourcePages[0] || 0) - (b.sourcePages[0] || 0)) || ((Number(a.no) || 0) - (Number(b.no) || 0)));
     uniq.forEach((q, i) => { if (q.no == null) q.no = i + 1; });
     const lowN = uniq.filter(q => q.lowConfidence).length;
+    // ---------- ④.5 AI 思考补全参考答案与解析（v13，prefs.fillAnswers 开启时） ----------
+    // 只补「卷面缺答案/缺解析」的题：answer/solution 为空的才进补全队列。
+    // 补全产物挂到 q.aiAnswer/q.aiSolution + aiFilled:true——绝不覆盖卷面原文字段，
+    // 客户端预览与卷页用「🧠 AI 补全」徽标区分展示（零幻觉：卷面有无答案永远可溯）。
+    let filledN = 0, fillFailN = 0;
+    if (prefs.fillAnswers) {
+      const needFill = uniq.filter(q => !String(q.answer || '').trim() || !String(q.solution || '').trim());
+      if (needFill.length) {
+        await setStatus('running', 'finalizing', '🧠 AI 思考补全 ' + needFill.length + ' 题的答案解析…', 86);
+        pushLog('🧠 开始补全：' + needFill.length + '/' + uniq.length + ' 题缺卷面答案或解析（思考模式逐题求解）');
+        await smartPool(needFill, 4, async (q) => {
+          try {
+            const r = await aiJson(
+              [{ role: 'system', content: importFillSystem(subj) },
+               { role: 'user', content: '【第 ' + (q.no || '?') + ' 题·' + (q.type || 'solve') + '】\n题干：' + String(q.stem).slice(0, 3000)
+                 + (Array.isArray(q.options) && q.options.length ? '\n选项：\n' + q.options.join('\n') : '')
+                 + (String(q.answer || '').trim() ? '\n（卷面已有答案，仅需补解析）：' + String(q.answer).slice(0, 300) : '') }],
+              { think: true, temperature: 0.2 });
+            const aiAns = String((r && r.answer) || '').trim();
+            const aiSol = String((r && r.solution) || '').trim();
+            if (/^无法求解/.test(aiAns) || (!aiAns && !aiSol)) {
+              fillFailN++;
+              q.aiNote = String((r && r.unsure) || aiAns || 'AI 判定信息不足').slice(0, 200);
+              pushLog('⚠️ 第 ' + (q.no || '?') + ' 题无法补全：' + String(q.aiNote).slice(0, 80), 'warn');
+              return;
+            }
+            if (!String(q.answer || '').trim() && aiAns) q.aiAnswer = aiAns;
+            if (!String(q.solution || '').trim() && aiSol) q.aiSolution = aiSol;
+            if (r.unsure) q.aiNote = String(r.unsure).slice(0, 200);
+            q.aiFilled = true;
+            filledN++;
+          } catch (e) {
+            fillFailN++;   // 单题失败不致命：该题保持无答案进人工复核
+            log('补全失败 @题' + (q.no || '?'), e.message);
+          }
+        }, (d, n) => setStatus('running', 'finalizing', '🧠 AI 补全中（' + d + '/' + n + ' 题）…', 86 + Math.round(d / n * 9)));
+        pushLog('🧠 补全完成：成功 ' + filledN + ' 题' + (fillFailN ? '，无法求解/失败 ' + fillFailN + ' 题（保持待人工）' : ''));
+      } else {
+        pushLog('🧠 已勾选补全，但所有题都有卷面答案与解析，跳过');
+      }
+    }
     const totalScore = uniq.reduce((a, q) => a + (Number(q.score) || 0), 0);
     const exam = {
       id: job.jobId + '-imp',
@@ -1106,6 +1274,7 @@ async function runImport(gist, job, prefs) {
       totalScore: totalScore || uniq.length * 5,
       questions: uniq,
       imported: true, lowConfidenceCount: lowN, failedPages: failedGroups.map(f => f.pages.join('+')),
+      aiFilledCount: filledN,
       builtBy: 'pdf-import', generatedAt: new Date().toISOString()
     };
     pushLog('✅ 识别完成：' + uniq.length + ' 题 · 待人工复核 ' + lowN + ' 题' + (failedGroups.length ? ' · 失败页组 ' + failedGroups.length : ''));
@@ -1231,7 +1400,33 @@ async function runImport(gist, job, prefs) {
     // 【2026-09-03】把生效蓝图提到主流程作用域：worker / chief / 终检都要用到 bp.starMix 与 bp.types
     // （不再在 plannerSystem 里局部声明，避免 worker/chief 引用不到）。
     const bp = resolveBpFromPrefs(subj, prefs);
-    await setStatus('running', 'planning', isResume ? ('续跑规划中…（已有 ' + resumeQs.length + ' 题，补 ' + resumeNeed + ' 题）') : '总工程师正在规划蓝图…', 5);
+    // 【v13 子母卷】derive 模式：先读母卷指纹 → AI 归纳「命题形式研究报告」→ 注入 planner。
+    //   研究报告失败不致命（降级为无风格约束的普通出卷，任务仍能完成，只是不"仿母卷"）。
+    let deriveStyleNote = null;
+    if (prefs.mode === 'derive' && !isResume) {
+      await setStatus('running', 'planning', '🧬 研究母卷命题形式…', 3);
+      try {
+        let srcTxt = await gistFileText(gist.files, 'source.json');
+        if (!srcTxt && SOURCE_GIST_ID) {
+          const assetGist = await ghRetry('GET', '/gists/' + SOURCE_GIST_ID);
+          srcTxt = await gistFileText((assetGist && assetGist.files) || {}, 'source.json');
+        }
+        if (!srcTxt) throw new Error('任务未携带 source.json 母卷指纹');
+        const src = JSON.parse(srcTxt);
+        pushLog('🧬 母卷《' + (src.motherTitle || '?') + '》指纹就绪：' + (src.questions || []).length + ' 题 · ★配比 ' + JSON.stringify(src.starMix || {}));
+        deriveStyleNote = await aiText(
+          [{ role: 'system', content: deriveStyleSystem(subj, prefs) },
+           { role: 'user', content: '【母卷命题形式指纹】\n' + JSON.stringify(src).slice(0, 30000) }],
+          { temperature: 0.3 });
+        deriveStyleNote = String(deriveStyleNote || '').trim().slice(0, 1200);
+        if (!deriveStyleNote) deriveStyleNote = null;
+        pushLog(deriveStyleNote ? ('📝 命题形式研究报告完成（' + deriveStyleNote.length + ' 字），据此规划子卷') : '⚠️ 研究报告为空，降级为普通出卷');
+      } catch (e) {
+        pushLog('⚠️ 母卷形式研究失败，降级为普通出卷：' + String((e && e.message) || e).slice(0, 120), 'warn');
+        deriveStyleNote = null;
+      }
+    }
+    await setStatus('running', 'planning', isResume ? ('续跑规划中…（已有 ' + resumeQs.length + ' 题，补 ' + resumeNeed + ' 题）') : (deriveStyleNote ? '🧬 子卷总工按母卷形式规划蓝图…' : '总工程师正在规划蓝图…'), 5);
     let plan;
     if (isResume && resumeNeed <= 0) {
       // 题已够：跳过规划与出题，直接进入终检打包（单纯把上次落盘的题走完审查流程）
@@ -1239,7 +1434,7 @@ async function runImport(gist, job, prefs) {
       pushLog('✅ 题量已满足（' + resumeQs.length + '/' + job.resume.target + '），跳过出题直接终检');
     } else if (isResume) {
       plan = await aiJson(
-        [{ role: 'system', content: plannerSystem(subj, prefs) },
+        [{ role: 'system', content: plannerSystem(subj, prefs, deriveStyleNote) },
          { role: 'user', content: '【续跑任务】本卷此前已出好 ' + resumeQs.length + ' 题，还缺 ' + resumeNeed + ' 题。\n'
            + '已有题目涉及的考点与设问角度如下——请只规划**剩余的 ' + resumeNeed + ' 题**，'
            + '严禁重复已有考点与设问角度（否则用户会拿到两道雷同的题）：\n'
@@ -1248,8 +1443,8 @@ async function runImport(gist, job, prefs) {
         {});
     } else {
       plan = await aiJson(
-        [{ role: 'system', content: plannerSystem(subj, prefs) },
-         { role: 'user', content: '请规划本卷蓝图。' }],
+        [{ role: 'system', content: plannerSystem(subj, prefs, deriveStyleNote) },
+         { role: 'user', content: deriveStyleNote ? '请依据上述母卷命题形式，规划一张同形式的子卷蓝图（新题、不复刻母卷）。' : '请规划本卷蓝图。' }],
         {});
     }
     // 续跑且题已够时 questions 允许为空；其余情况空蓝图就是失败
@@ -1278,7 +1473,7 @@ async function runImport(gist, job, prefs) {
     // ③ 并发出题池
     let genDone = 0;
     const genTotal = plan.questions.length;
-    let questions = genTotal ? await pool(plan.questions, 4, async (pq, i) => {
+    let questions = genTotal ? await smartPool(plan.questions, 4, async (pq, i) => {
       const ci = await checkCancel();
       if (ci && ci.canceled) throw new CancelError('cancel');
       QS[i].st = 'run';
@@ -1369,7 +1564,7 @@ async function runImport(gist, job, prefs) {
     if (rewriteList.length) {
       await setStatus('running', 'rewriting', '定向重写 ' + rewriteList.length + ' 题…', 68);
       rewriteList.forEach(rw => { const q = QS[rw.index - 1]; if (q) q.st = 'rewrite'; });
-      await pool(rewriteList, 3, async (rw) => {
+      await smartPool(rewriteList, 3, async (rw) => {
         const i = rw.index - 1;
         const old = questions[i];
         if (!old) return null;
