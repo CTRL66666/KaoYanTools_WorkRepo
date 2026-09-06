@@ -131,7 +131,8 @@ async function readSourceBuffer(files, tag) {
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-const RUNNER_VER = 'v14';
+// 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道：PDF 整本 → AI 章节划分 → 分章提取讲义+题目）。
+const RUNNER_VER = 'v15';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1031,9 +1032,24 @@ function garbledRatio(txt) {
   flushRun();
   return Math.max(rare / n, runCover / n, topCnt / n * 0.9);
 }
-// 一页文字层 → 该页转视觉；阈值 0.45：真页（中英混排/公式）rare<0.3、cover≈0、top 字频贡献 <0.12
-// 均远低于阈值；CID 乱码页（生僻字主导 + 高重复）ratio 通常 >0.6。漏网的由第二层防御兜底。
-function pageIsGarbled(txt) { return garbledRatio(txt) > 0.45; }
+// 一页文字层是否「文本通道不可用」→ 转视觉。两个独立信号（任一命中即转）：
+// ① garbledRatio > 0.45：CID 碎片乱码（狶狶狶式，生僻字主导+高重复）；
+// ② PUA 私有区字符（\uE000-\uF8FF）占比 >3% 或绝对数 >30：字体无 ToUnicode 映射的
+//    「半坏文字层」——真·实测样本（李林四套卷）中文正常但公式括号全变 \uf0ee\uf0ee，
+//    pypdf 字频 rare 高达 0.80；整体 ratio 只 0.36 会漏判，但 PUA 信号 100% 特异
+//    （正常 PDF 文字层零 PUA）。公式残缺对文本模型是噪声，视觉模型反而能看原型。
+function puaCount(txt) {
+  let n = 0;
+  for (const ch of String(txt || '')) { const c = ch.codePointAt(0); if (c >= 0xE000 && c <= 0xF8FF) n++; }
+  return n;
+}
+function pageIsGarbled(txt) {
+  if (garbledRatio(txt) > 0.45) return true;
+  const s = String(txt || '').replace(/\s+/g, '');
+  if (s.length < 30) return false;
+  const pua = puaCount(txt);
+  return pua > 30 || pua / s.length > 0.03;
+}
 function importTextSystem(subj) {
   return '你是考研' + subjName(subj) + '试卷数字化工程师。用户给你一份试卷其中几页的文字层提取（pdftotext 输出，'
     + '可能含页眉页脚、双栏错序、公式残缺、题目跨页）。任务：把每一道题完整还原成结构化 JSON。'
@@ -1103,6 +1119,15 @@ function normalizeImported(q, g) {
     fromImport: true, importKind: g.kind, importNote: validateImported(q) || ''
   };
 }
+function bookChapterSystem(subject, kind) {
+  const kn = kind === '习题册' ? '习题册' : '讲义';
+  return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文（文字层提取，可能有排版噪声）。'
+    + '请产出本章的结构化学习内容，只输出 JSON（不要 markdown 围栏）：'
+    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"stem":"题目原文","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
+    + '要求：1) content 提炼本章真正的知识内容（定义/定理/方法/结论/例题讲解），每段≤300字，按原文顺序，公式用 $…$ LaTeX；'
+    + '2) questions 提取原文中出现的例题与习题（保留题号），没有题目就给空数组；3) 忠实原文，禁止编造原文没有的内容；4) 用简体中文。';
+}
+
 async function runImport(gist, job, prefs) {
   const subj = prefs.subject && prefs.subject !== 'auto' ? prefs.subject : (prefs.importSubject || 'math');
   // ---------- ① 拉源文件 ----------
@@ -1173,7 +1198,7 @@ async function runImport(gist, job, prefs) {
       const pm = vi.out.match(/^Pages:\s+(\d+)/m);
       const pages = pm ? parseInt(pm[1], 10) : 0;
       if (!pages) throw new Error('PDF 页数为 0');
-      if (pages > 40) throw new Error('共 ' + pages + ' 页，超过单次导入上限 40 页（建议拆分后分批导入）');
+      if (pages > (prefs.mode === 'book' ? 300 : 40)) throw new Error('共 ' + pages + ' 页，超过单次导入上限 ' + (prefs.mode === 'book' ? 300 : 40) + ' 页（' + (prefs.mode === 'book' ? '建议按章拆分后分批导入' : '建议拆分后分批导入') + '）');
       pushLog('🧾 pdfinfo：' + pages + ' 页，逐页提取文字层…');
       const pgTxt = {};
       for (let p = 1; p <= pages; p++) {
@@ -1236,6 +1261,80 @@ async function runImport(gist, job, prefs) {
         const chunk = imgPages.slice(i, i + 2);
         const pngs = await renderPageImgs(chunk);
         if (pngs.length) groups.push({ kind: 'img', imgs: pngs, pages: chunk });
+      }
+
+      /* 【2026-09-06 资料库·book 分支】讲义/习题册整本导入：
+       * 与试卷拆题共用逐页文字提取与乱码判定，分支差异在 AI 目标——
+       *   ① AI 目录划分（整本 → 章节页码范围，2-30 章）
+       *   ② 分章提取（并发 2）：讲义要点段落 + 例题/习题（题干/答案/解析）
+       *   ③ book.json（结构 = studyBook 记录）→ 前端资料库阅读
+       * v1 边界：仅处理文字层页；乱码/扫描页跳过并记录（电子讲义/习题册绝大多数是文字层 PDF）。 */
+      if (prefs.mode === 'book') {
+        if (garbledN) pushLog('⚠️ ' + garbledN + ' 页乱码/扫描页跳过（资料库 v1 仅处理文字层页）');
+        await setStatus('running', 'parsing', '🗂 AI 划分章节结构…', 15);
+        const digest = [];
+        for (let p = 1; p <= pages; p++) {
+          const t = String(pgTxt[p] || '').replace(/\s+/g, ' ').trim();
+          if (t.length >= 40) digest.push('P' + p + ': ' + t.slice(0, 110));
+        }
+        if (digest.length < 3) throw new Error('可读文字页过少（' + digest.length + ' 页）——纯扫描版 PDF 暂不支持整本导入，可按章拍照分批处理');
+        const outline = await aiJson(
+          [{ role: 'system', content: '你是教材结构分析专家。根据一份资料的逐页摘要（P页码: 内容首行）划分章节结构。只输出 JSON：{"chapters":[{"title":"章节名(≤24字)","from":起始页,"to":结束页}]}。要求：2-30 个章节；页码范围连续、覆盖全部有内容的页；粒度=书的一级目录（章/讲），不要拆到小节。' },
+           { role: 'user', content: '【逐页摘要】（共 ' + pages + ' 页）\n' + digest.join('\n') + '\n\n请划分章节。' }],
+          { think: false, temperature: 0.2, maxTokens: JOB_MAXTOK });
+        const chapters = (Array.isArray(outline.chapters) ? outline.chapters : [])
+          .map(c => ({ title: String((c && c.title) || '未命名章节').slice(0, 24), from: Math.max(1, Number(c && c.from) || 1), to: Math.min(pages, Number(c && c.to) || 1) }))
+          .filter(c => c.to >= c.from).slice(0, 30);
+        if (!chapters.length) throw new Error('AI 未划分出有效章节');
+        pushLog('🗂 章节划分：' + chapters.length + ' 章（' + chapters.map(c => c.from + '-' + c.to).join('，') + '）');
+
+        // ② 分章提取（并发 2）：要点段落 + 题目，每章独立落盘
+        const out = [];
+        let done = 0;
+        await pool(chapters, 2, async (ch, ci) => {
+          await cancelCheckpoint();
+          let text = '';
+          for (let p = ch.from; p <= ch.to; p++) text += '\n【P' + p + '】\n' + String(pgTxt[p] || '');
+          text = text.trim().slice(0, 24000);
+          if (!text) return;
+          const res = await aiJson(
+            [{ role: 'system', content: bookChapterSystem(subject, prefs.bookKind) },
+             { role: 'user', content: '【章节】' + ch.title + '（原文页 ' + ch.from + '-' + ch.to + '）\n【原文】\n' + text + '\n\n请按系统规约提取本章讲义要点与题目，只输出 JSON。' }],
+            { think: false, temperature: 0.3, maxTokens: 16000 });
+          const content = (Array.isArray(res.content) ? res.content : []).map(x => String(x || '').trim().slice(0, 500)).filter(Boolean).slice(0, 30);
+          const questions = (Array.isArray(res.questions) ? res.questions : []).slice(0, 30).map(function (q, qi) {
+            return {
+              id: 'bq' + ci + '_' + qi,
+              stem: String((q && q.stem) || '').trim().slice(0, 600),
+              options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => String(o || '').slice(0, 120)) : undefined,
+              answer: String((q && q.answer) || '').trim().slice(0, 200),
+              solution: String((q && q.solution) || '').trim().slice(0, 800),
+            };
+          }).filter(q => q.stem);
+          if (!content.length && !questions.length) return;
+          out.push({ id: 'ch' + (ci + 1), title: (ch.title || '章节').slice(0, 24), from: ch.from, to: ch.to, content: content, questions: questions });
+          done++;
+          await setStatus('running', 'extracting', '📖 已提取 ' + done + '/' + chapters.length + ' 章 · ' + ch.title, 20 + Math.round(done / chapters.length * 70));
+        }, (d, n) => { });
+        out.sort((a, b) => a.from - b.from);
+        const qTotal = out.reduce((a, c) => a + c.questions.length, 0);
+        if (!out.length) throw new Error('全部章节提取失败（模型未产出有效内容）——可重试或换模型');
+        const book = {
+          id: (job.jobId || 'book') + '-book',
+          title: (String(prefs.bookTitle || '').trim() || '未命名资料').slice(0, 60),
+          kind: (prefs.bookKind === '习题册' ? '习题册' : '讲义'),
+          subject: subject,
+          chapters: out, chapterCount: out.length, questionCount: qTotal,
+          basedOnPages: pages, builtBy: 'book-import', generatedAt: new Date().toISOString()
+        };
+        pushLog('✅ 整本提取完成：' + out.length + ' 章 · ' + qTotal + ' 题');
+        dropPendingStatus();
+        await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
+          'result.json': { content: JSON.stringify({ builtBy: 'book-import', book: book }) },
+          'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📚 整本提取完成（' + out.length + ' 章 · ' + qTotal + ' 题），可收录到资料库', progress: 100, log: RUN_LOG, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER, isBook: true }) }
+        } });
+        log('✅ 资料库任务完成');
+        return;
       }
     }
     if (!groups.length) throw new Error('没有可识别的页面（文字层与转图均失败）');
