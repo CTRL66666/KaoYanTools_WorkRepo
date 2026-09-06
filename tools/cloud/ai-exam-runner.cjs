@@ -131,8 +131,8 @@ async function readSourceBuffer(files, tag) {
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-// 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道：PDF 整本 → AI 章节划分 → 分章提取讲义+题目）。
-const RUNNER_VER = 'v15';
+// 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复）。
+const RUNNER_VER = 'v16';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -447,15 +447,30 @@ function aiCall(messages, opts = {}) {
     req.end();
   });
 }
+// 【v16 429 共享闸门】全部 AI 调用共用一个限流闸门（单一收口）：任一调用撞 429 就把闸门推远
+// （指数 + 抖动），所有在途/后续调用在闸门前排队错峰重试。旧实现各 worker 独立退避固定 15s——
+// 10 路同时撞 429 → 同时睡 15s → 同时重撞（惊群），低并发量 API（2~3 路）被撞得整段失败。
+let AI_GATE_UNTIL = 0;    // 闸门截止时间戳（最新一次 429 推远它）
+let AI_GATE_STRIKES = 0;  // 连续 429 计数（指数退避档位）
+let AI_GATE_LAST_LOG = 0; // 日志去重：风暴期每 10s 最多一行，不刷屏
+async function aiGateWait() {
+  while (Date.now() < AI_GATE_UNTIL) {
+    await sleep(Math.min(AI_GATE_UNTIL - Date.now(), 800) + Math.random() * 250);   // 轮询 + 抖动：唤醒天然错峰
+  }
+}
 async function aiRetry(messages, opts, tries = 3) {
-  for (let i = 0; ; i++) {
+  const deadline = Date.now() + 10 * 60000;   // 限流整体等待预算（防死循环；闸门是全员共享的，等待并行不叠加）
+  let i = 0;   // 非 429 失败计数：429 不占重试次数——限流是全员的事，不能烧掉单题的重试配额（旧实现弃题的根源）
+  for (;;) {
     try {
+      await aiGateWait();
       // 【H5】只给「慢调用」打点：每题都记耗时会把日志淹没，而出卷卡住时用户真正想知道的
       // 就是「是哪一次调用特别慢」。阈值 30s（正常出题 10~40s，超 60s 基本可判定异常）。
       const _t0 = Date.now();
       const r = await aiCall(messages, opts);
       const _dur = Date.now() - _t0;
       if (_dur >= 30000) pushLog('🐢 AI 调用较慢：' + Math.round(_dur / 1000) + 's' + (_dur >= 60000 ? '（异常，可能是思考模型在长推理）' : ''), 'warn', _dur);
+      AI_GATE_STRIKES = Math.floor(AI_GATE_STRIKES / 2);   // 成功半衰（不清零：混合流量下避免闸门反复失守）
       return r;
     }
     catch (e) {
@@ -477,17 +492,26 @@ async function aiRetry(messages, opts, tries = 3) {
       }
       // 其他 4xx（除 429/408）：请求本身有问题（模型名错/参数错），重试也不会好
       if (code && code >= 400 && code < 500 && code !== 429 && code !== 408) throw e;
-      // 429 限流：退避加倍重试（限流是暂时的，多等一会儿比失败好）
-      if (code === 429 && i < tries - 1) {
-        log('AI 限流 429，退避', 15 * (i + 1), 's 后重试');
-        pushLog('⏳ AI 限流 429，退避 ' + (15 * (i + 1)) + 's 后重试（第 ' + (i + 1) + ' 次）', 'warn');
-        await sleep(15000 * (i + 1));
+      // 429 限流：推远全局闸门（指数 + 抖动），不占 tries，超时预算内一直重试——题目绝不因限流被弃
+      if (code === 429 || code === 408) {
+        if (Date.now() >= deadline) throw e;
+        AI_GATE_STRIKES++;
+        const backoff = Math.min(60000, 5000 * Math.pow(2, Math.min(AI_GATE_STRIKES - 1, 4))) * (0.8 + Math.random() * 0.4);
+        const until = Date.now() + backoff;
+        if (until > AI_GATE_UNTIL) {
+          AI_GATE_UNTIL = until;
+          if (Date.now() - AI_GATE_LAST_LOG > 10000) {
+            AI_GATE_LAST_LOG = Date.now();
+            pushLog('⏳ AI 限流 429：全局退避 ' + Math.round(backoff) + 's（连续 ' + AI_GATE_STRIKES + ' 次）——所有在途调用共享闸门、抖动错峰重试，题目不弃', 'warn');
+          }
+        }
         continue;
       }
       if (i >= tries - 1) throw e;
-      log('AI 调用失败重试', i + 1, e.message);
-      pushLog('🔁 AI 调用失败，' + (3 * (i + 1)) + 's 后重试（第 ' + (i + 1) + '/' + (tries - 1) + ' 次）：' + String(e.message).slice(0, 80), 'warn');
-      await sleep(3000 * (i + 1));
+      i++;
+      log('AI 调用失败重试', i, e.message);
+      pushLog('🔁 AI 调用失败，' + (3 * i) + 's 后重试（第 ' + i + '/' + (tries - 1) + ' 次）：' + String(e.message).slice(0, 80), 'warn');
+      await sleep(3000 * i);
     }
   }
 }
@@ -755,6 +779,80 @@ const SUBJ_TO_PRESET = { math: 'shuyi', ctrl: 'ctrl', eng: 'yingyi', pol: 'pol' 
 // 【2026-09-03 链路加固】从蓝图反推每道题的 score —— 不再相信出题 AI 自报 score。
 // 出题 schema 里没有 score 字段，AI 会自由发挥（常全 5）；必须由 blueprint.types[].score 决定性覆盖。
 // 旧版兜底 "|| 5" 是分值失真总根源（22 题 × 5 = 110 ≠ bp.totalScore 150，趋势图分母/成绩单档位全错）。
+// 【2026-09-06 v16 修复·score=0 自动均摊】蓝图单题分值 0 = 剩余分自动均摊（本地 exam-pipeline.bpAutoScores
+// 一直有此语义，云端从来没有）——旧 scoreForType 对 0 分行直接回 0，云端数一卷 6 道解答题全 0 分，
+// 最后靠「总分对齐」把 86 分全贴给最后一题（0,0,0,0,0,86）。现按本地同款算法均摊（0.5 分刻度）。
+function bpAutoScores(bp) {
+  var fixed = 0, autoN = 0;
+  ((bp && bp.types) || []).forEach(function (t) {
+    if (t.score > 0) fixed += t.count * t.score;
+    else autoN += t.count;
+  });
+  var rest = Math.max(0, (bpTotalScore(bp)) - fixed);
+  if (!autoN) return [];
+  var per = Math.floor((rest / autoN) * 2) / 2;
+  var scores = [];
+  for (var i = 0; i < autoN; i++) scores.push(per);
+  var leftover = Math.round((rest - per * autoN) * 2) / 2;
+  for (var j = autoN - 1; j >= 0 && leftover > 0; j--) { scores[j] += 0.5; leftover -= 0.5; }
+  return scores;
+}
+// 蓝图分值队列：type → [分数...]（按蓝图行序展开；score=0 行从均摊序列依次取）。
+function bpScoreQueues(bp) {
+  var auto = bpAutoScores(bp), k = 0, q = {};
+  ((bp && bp.types) || []).forEach(function (t) {
+    var arr = q[t.type] || (q[t.type] = []);
+    for (var i = 0; i < (t.count || 0); i++) arr.push(t.score > 0 ? Number(t.score) : (auto[k++] || 0));
+  });
+  return q;
+}
+
+// ==================== 【v16 蓝本槽位制】蓝本是卷面结构的唯一事实来源 ====================
+// 旧链路：规划 AI 自由返回题型分布 → 只覆盖 score/star，题型数量错了没人管，直到终检 blueprintCheck
+// 才暴露「题量不符/题型错位」，整卷返工。新链路：
+//   ① bpSlots：按蓝本 types 顺序展开权威槽位（qid/type/score/star 全由槽位决定；
+//      star 按 starMix 最大余数法装桶、升序排列 = 压轴在后的真题节奏，与本地 bpPerQuestionPlan 同款）；
+//   ② reconcilePlanSlots：AI 规划题按「题型一致 + 顺序就近」入槽——AI 只贡献内容（考点/方向），
+//      结构字段全被槽位覆盖；
+//   ③ 缺槽 → 一次补规划（只补缺的题型/数量）；超产 → 弃用。AI 再怎么跑偏，卷面结构永不错位。
+function bpSlots(bp) {
+  var n = bpQuestionCount(bp);
+  var targets = starMixTargets(bp, n);
+  var starPool = [];
+  for (var s = 1; s <= 5; s++) for (var k = 0; k < (targets[s] || 0); k++) starPool.push(s);
+  var auto = bpAutoScores(bp), k2 = 0, qid = 0, slots = [];
+  ((bp && bp.types) || []).forEach(function (t) {
+    for (var i = 0; i < (t.count || 0); i++) {
+      qid++;
+      var poolIdx = Math.round((qid - 1) / Math.max(1, n - 1) * (starPool.length - 1));
+      slots.push({
+        qid: qid, type: t.type, label: t.label,
+        score: t.score > 0 ? Number(t.score) : (auto[k2++] || 0),
+        star: starPool[Math.min(poolIdx, starPool.length - 1)] || 3
+      });
+    }
+  });
+  return slots;
+}
+function reconcilePlanSlots(planQuestions, bp) {
+  var slots = bpSlots(bp);
+  var ai = Array.isArray(planQuestions) ? planQuestions.slice() : [];
+  var used = new Array(ai.length).fill(false);
+  var filled = [], missing = [];
+  slots.forEach(function (slot) {
+    var pick = -1;
+    for (var i = 0; i < ai.length; i++) {
+      if (used[i]) continue;
+      if (String(ai[i].type || 'solve') === slot.type) { pick = i; break; }   // 同题型顺序就近
+    }
+    if (pick < 0) { missing.push(slot); return; }
+    used[pick] = true;
+    var q = ai[pick];
+    q.type = slot.type; q.score = slot.score; q.star = slot.star; q.qid = slot.qid; q._slotLabel = slot.label;
+    filled.push(q);
+  });
+  return { questions: filled, missing: missing, extras: ai.filter(function (q, i) { return !used[i]; }) };
+}
 function scoreForType(bp, qtype) {
   var types = (bp && bp.types) || [];
   var t = types.find(function (x) { return x && x.type === qtype; });
@@ -762,9 +860,17 @@ function scoreForType(bp, qtype) {
   return Number(t.score) || 0;
 }
 // 把"每题 score 应分"转成自然语言描述注入 plannerSystem，让 AI 在规划阶段就把 score 写齐（方便审查对照）。
+// 【v16】0 分行显示均摊结果（如"均摊14~14.5分"），不再让规划 AI 看到"0分/solve"自由发挥。
 function scoreSpecText(bp) {
+  var auto = bpAutoScores(bp), k = 0;
   var types = (bp && bp.types) || [];
-  return types.map(function (t) { return (t.score || 0) + '分/' + (t.type || '?') + '×' + t.count + '道'; }).join('，');
+  return types.map(function (t) {
+    if (t.score > 0) return t.score + '分/' + (t.type || '?') + '×' + t.count + '道';
+    var slice = auto.slice(k, k + (t.count || 0)); k += (t.count || 0);
+    if (!slice.length) return '均摊/' + (t.type || '?') + '×' + t.count + '道';
+    var mn = Math.min.apply(null, slice), mx = Math.max.apply(null, slice);
+    return '均摊' + (mn === mx ? mn : mn + '~' + mx) + '分/' + (t.type || '?') + '×' + t.count + '道';
+  }).join('，');
 }
 // 把"bp.starMix 比例"转成"目标数量"：例如 {1:0,2:15,3:45,4:30,5:10} + 22 题 → ★2×3 / ★3×10 / ★4×7 / ★5×2
 // 出题完成后若分布明显偏离（±2 道以上）做一次 forceStarMix 再平衡，star 字段不再是 AI 自由发挥。
@@ -1057,7 +1163,8 @@ function importTextSystem(subj) {
     + '②题目跨页出现时合并为一题（sourcePages 给全部页码）。③公式保留为 LaTeX（$...$），文字层里错乱的上下标/根号按你能确定的最小修改还原；'
     + '拿不准是否还原正确就把 confidence 调低（0-1 小数），不要猜。④题号 no 用卷面原题号（数字），分卷/无题号按出现顺序编号。'
     + '⑤页眉页脚、答题卡填涂说明、注意事项等非试题文字一律丢弃。'
-    + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"sourcePages":[1],"confidence":0.95}]}';
+    + '⑥star 为难度粗评（1=送分直接套公式 … 5=压轴综合），看信息量/计算量/思维量快速判断即可，不必精确。'
+    + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"star":1-5,"sourcePages":[1],"confidence":0.95}]}';
 }
 function importVisionSystem(subj) {
   return '你是考研' + subjName(subj) + '试卷数字化工程师。用户给你试卷整页的高清图片（扫描版/拍照版）。'
@@ -1066,7 +1173,8 @@ function importVisionSystem(subj) {
     + '②卷面没印答案就 answer:"" + noAnswer:true，严禁用你的知识"顺手解出来"冒充卷面答案。'
     + '③数学公式必须用 LaTeX（$...$）准确还原（分式/根号/上下标/积分号）。④题号 no 用卷面原题号。'
     + '⑤一道题跨页时在两页都识别完整部分，sourcePages 标该页即可（合并由系统处理）。'
-    + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"sourcePages":[1],"confidence":0.95}]}';
+    + '⑥star 为难度粗评（1=送分直接套公式 … 5=压轴综合），看信息量/计算量/思维量快速判断即可，不必精确。'
+    + '只输出 JSON：{"questions":[{"no":1,"stem":"题干","type":"choice|fill|solve|essay","options":["A. ..","B. ..","C. ..","D. .."],"answer":"卷面答案","solution":"卷面解析（没有则空串）","noAnswer":false,"topicName":"考点","score":数字或null,"star":1-5,"sourcePages":[1],"confidence":0.95}]}';
 }
 // 【v13 答案解析补全】解答器：给卷面缺答案/解析的题补「AI 参考答案」。
 //   与转录通道解耦——转录铁律「严禁顺手解题」保持不变，补全是独立显式步骤（用户勾选才会跑）。
@@ -1109,12 +1217,16 @@ function normalizeImported(q, g) {
   // choice 答案不在选项内（validateImported 拦下）→ 同样标低置信，交人工裁决
   if (validateImported(q)) low = true;
   let pages = Array.isArray(q.sourcePages) && q.sourcePages.length ? q.sourcePages.map(Number).filter(n => n > 0) : (g.pages || []);
+  // 【v16 导入评星】AI 粗评难度 1-5（缺失/非法回退 3）——导入卷不再全员三星
+  const starRaw = Math.round(Number(q.star));
+  const star = (starRaw >= 1 && starRaw <= 5) ? starRaw : 3;
   return {
     no: Number(q.no) || null,
     stem: stem, type: type, options: options.length === 4 ? options : undefined,
     answer: answer, solution: q.solution == null ? '' : String(q.solution).trim(),
     noAnswer: noAnswer, topicName: q.topicName == null ? '' : String(q.topicName).trim(),
     score: typeof q.score === 'number' && q.score > 0 ? q.score : null,
+    star: star,
     sourcePages: pages, confidence: conf, lowConfidence: low,
     fromImport: true, importKind: g.kind, importNote: validateImported(q) || ''
   };
@@ -1640,12 +1752,45 @@ async function runImport(gist, job, prefs) {
     if (!plan || !Array.isArray(plan.questions)) throw new Error('蓝图规划失败：返回格式不对');
     if (!plan.questions.length && !(isResume && resumeNeed <= 0)) throw new Error('蓝图规划失败：无 questions');
     // 【2026-09-03 链路加固】蓝图落地时按 bp 决定性覆盖 score + star，AI 自由发挥不再生效。
-    // 1) score 用 scoreForType(bp, type) 反查（避免 AI 全填 5）；2) star 用 clampStar 兜底（避免 ?）;
-    // 3) starMixTargets/bp 决定每题目标档 → 超过 ±2 道差异再 forceStarMix 再平衡。
-    plan.questions.forEach(function (pq, i) {
-      pq.score = scoreForType(bp, pq.type);
-      pq.star = clampStar(pq.star);
-    });
+    // 【v16 蓝本槽位制】结构归位：题型/数量/分值/星级全由蓝本槽位决定，AI 只贡献内容；
+    // 缺槽自动补规划一轮，超产弃用——卷面结构永不错位（不再等终检 blueprintCheck 才发现跑偏）。
+    // 【注意】续跑路径只规划「剩余缺题」，不是全卷蓝图 —— 跳过归位；score 按题型队列出队
+    // （含 0 分行均摊序列，与已落盘题保持同口径），星级 clampStar 兜底。
+    if (isResume) {
+      var scoreQueuesResume = bpScoreQueues(bp);
+      plan.questions.forEach(function (pq) {
+        var arr = scoreQueuesResume[pq.type];
+        pq.score = (arr && arr.length) ? arr.shift() : scoreForType(bp, pq.type);
+        pq.star = clampStar(pq.star);
+      });
+    } else {
+      var rec = reconcilePlanSlots(plan.questions, bp);
+      if (rec.extras.length) pushLog('🧹 弃用超产规划题 ' + rec.extras.length + ' 道（题型不符合蓝本槽位）');
+      if (rec.missing.length) {
+        pushLog('🧩 蓝图归位缺口 ' + rec.missing.length + ' 题（' + rec.missing.map(function (m2) { return m2.label || m2.type; }).join('、') + '），自动补规划…', 'warn');
+        try {
+          const repair = await aiJson(
+            [{ role: 'system', content: plannerSystem(subj, prefs, deriveStyleNote) },
+             { role: 'user', content: '【只补规划缺失题位】整卷大部分题位已规划完成，请只补规划以下缺失题位'
+               + '（题型/星级/分值必须严格按给定槽位，考点优先取尚未覆盖的薄弱方向，禁止与其他题位重复考点）：\n'
+               + rec.missing.map(function (m2, i2) { return (i2 + 1) + '. type=' + m2.type + ' ★' + m2.star + ' ' + m2.score + ' 分'; }).join('\n')
+               + '\n只输出 JSON：{"questions":[{"topicName":"考点","type":"…","direction":"…","star":1-5,"score":分值}]}，'
+               + '数组长度必须恰好为 ' + rec.missing.length + '，顺序与上述题位一一对应。' }],
+            {});
+          var repaired = 0;
+          (repair && Array.isArray(repair.questions) ? repair.questions : []).forEach(function (q, i2) {
+            if (i2 >= rec.missing.length) return;
+            var slot = rec.missing[i2];
+            q.type = slot.type; q.score = slot.score; q.star = slot.star; q.qid = slot.qid; q._slotLabel = slot.label;
+            rec.questions.push(q); repaired++;
+          });
+          pushLog('🧩 补规划完成：+' + repaired + ' 题' + (repaired < rec.missing.length ? '（仍缺 ' + (rec.missing.length - repaired) + ' 题，终检将如实标记）' : ''));
+        } catch (e) {
+          pushLog('⚠️ 补规划失败（继续用已归位的题）：' + String((e && e.message) || e).slice(0, 80), 'warn');
+        }
+      }
+      plan.questions = rec.questions;
+    }
     var planStarMix = forceStarMix(plan.questions, bp);
     log('蓝图完成：', plan.questions.length, '题 ·', plan.title || '', '· star 分布=', JSON.stringify(planStarMix.distribution));
     pushLog('🗺 蓝图《' + (plan.title || '未命名卷') + '》规划完成：共 ' + plan.questions.length + ' 题 · 限时 ' + (plan.timeLimit || 120) + ' 分钟 · ★分布 ' + JSON.stringify(planStarMix.distribution));
@@ -1674,11 +1819,13 @@ async function runImport(gist, job, prefs) {
          { role: 'user', content: '蓝图第' + (i + 1) + '题：' + JSON.stringify(pq) }],
         {});
       out.topicName = pq.topicName || out.topicName || '';
-      // 【2026-09-03】出题 AI 经常乱填 score → 一律按蓝图 scoreForType 决定性覆盖；
+      // 【2026-09-03】出题 AI 经常乱填 score → 按蓝图决定性覆盖；【v16】直接取规划阶段算好的
+      // pq.score（含 0 分行均摊值）——旧实现按题型反查，出题阶段在完成顺序上乱序覆盖，
+      // 同题型多行（英语一 choice 0.5/2 分）会全部错配到第一行。
       // diff 字段也按 clampStar 反推，避免与 star 自相矛盾。
-      out.score = scoreForType(bp, out.type || pq.type);
+      out.score = pq.score;
       out.type = pq.type || out.type || 'solve';
-      out.star = clampStar(out.star);
+      out.star = clampStar(pq.star);   // 【v16 槽位制】星级由蓝本槽位决定（AI 自由发挥不生效）
       out.diff = ({ 1: 'easy', 2: 'easy', 3: 'medium', 4: 'hard', 5: 'hard' })[out.star] || 'medium';
       if (!validateQuestion(out)) {
         QS[i].st = 'done';
@@ -1773,7 +1920,8 @@ async function runImport(gist, job, prefs) {
           const pq0 = plan.questions[i];
           cand.topicName = old.topicName || (pq0 && pq0.topicName) || '';
           // 【2026-09-03】重写也按蓝图决定性覆盖 score（避免 AI 在重写 prompt 里再填 5）
-          cand.score = scoreForType(bp, cand.type || (pq0 && pq0.type) || old.type);
+          // 【v16】优先取蓝图规划阶段算好的 pq0.score（含均摊值）；旧题占位/续跑丢失时退回按行反查
+          cand.score = (pq0 && pq0.score) || scoreForType(bp, cand.type || (pq0 && pq0.type) || old.type);
           cand.type = old.type || (pq0 && pq0.type) || cand.type;
           cand.star = clampStar(cand.star);
           cand.diff = ({ 1: 'easy', 2: 'easy', 3: 'medium', 4: 'hard', 5: 'hard' })[cand.star] || 'medium';
@@ -1803,14 +1951,18 @@ async function runImport(gist, job, prefs) {
     var finalMix = forceStarMix(questions, bp);
     if (finalMix.changed > 0) pushLog('🎯 终检再平衡 star 配比：调整 ' + finalMix.changed + ' 题 → ' + JSON.stringify(finalMix.distribution));
     // 【2026-09-03】总分对齐：Σ q.score 必须 = bp.totalScore（除不尽的零头贴最后一题）。
-    // 出题阶段已按 scoreForType 决定性覆盖，理论已对齐；此处兜底防止某个 review/chief 误改了 score。
+    // 出题阶段已按蓝本槽位决定性覆盖，理论已对齐；此处兜底防止某个 review/chief 误改了 score。
+    // 【v16 护栏】贴齐上限 5 分——差得多说明有题位没出齐（补规划也失败了），把 40 分贴给
+    // 最后一题是荒谬的（旧数一卷出现过 0,0,0,0,0,86），如实保留缺口让 blueprintCheck 标记。
     var bpTotal = bpTotalScore(bp);
     var sumScore = questions.reduce(function (a, q) { return a + (Number(q.score) || 0); }, 0);
-    if (Math.abs(sumScore - bpTotal) > 0.01 && questions.length) {
+    if (Math.abs(sumScore - bpTotal) > 0.01 && questions.length && Math.abs(bpTotal - sumScore) <= 5) {
       var drift = +(bpTotal - sumScore).toFixed(2);
       questions[questions.length - 1].score = +((Number(questions[questions.length - 1].score) || 0) + drift).toFixed(2);
       sumScore = questions.reduce(function (a, q) { return a + (Number(q.score) || 0); }, 0);
       pushLog('⚖️ 总分对齐：原 Σ ' + sumScore.toFixed(0) + ' → 强制贴齐蓝图 ' + bpTotal + '（最后一题吸收 ' + drift + ' 分）');
+    } else if (Math.abs(sumScore - bpTotal) > 5) {
+      pushLog('⚠️ 总分 Σ ' + sumScore + ' ≠ 蓝图 ' + bpTotal + '（差 ' + Math.round(Math.abs(bpTotal - sumScore)) + ' 分，疑有题位未出齐——不做贴齐，如实标记）', 'warn');
     }
     const totalScore = sumScore;
     const exam = {
