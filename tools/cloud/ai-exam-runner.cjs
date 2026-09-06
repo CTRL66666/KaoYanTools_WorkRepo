@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v17';
+const RUNNER_VER = 'v18';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1257,6 +1257,129 @@ function bookChapterVisionSystem(subject, kind) {
     + '4) 忠实原文，禁止编造原文没有的内容；5) 用简体中文。';
 }
 
+/* 【v18 两级目录·确定性解析器】「85 套卷」这类多卷合集书的正确结构 = 大类（入门/进阶/难/系列）→ 小类（每套卷一章）。
+ * 书自带目录页（标题 … 页码）时，页码是作者给的权威事实——直接解析，零 AI 猜测：
+ *   ① 前几页找「目录页」：≥6 行「标题 + 引导点/空格 + 页码」且页码单调不减；随后 ≥3 行的连续页并入（跨页目录）；
+ *   ② 目录内「入门/进阶/难」这类层级标题（短、不含套/卷/题/数字、与下一条同页）识别为大类专业分隔，
+ *      不成章，同时确定性给出每个小类的 group（省掉一次 AI 调用）；没有这类标题时才让调用方跑 AI 归类；
+ *   ③ 印刷页码 → 物理页：offset = 目录后首页 − 最小印刷页（印刷页码连续编号的常见情形）；
+ *   ④ 相邻条目页码差即每套卷的页范围，末章到全书最后一页。
+ * 返回 {chapters:[{title,from,to,group}], headersFound, tocLastPage, entries} 或 null（无目录页 → 调用方走 AI 划分）。
+ * 纯函数：不依赖任何模块作用域，可被单测直接求值调用。 */
+function extractBookToc(pgTxt, pages) {
+  const entryRe = /^\s*(.{2,40}?)[\s.…·⋯\-]{2,}(\d{1,3})\s*$/;
+  const pageHits = [];
+  const scanTo = Math.min(pages, 10);
+  for (let p = 1; p <= scanTo; p++) {
+    const lines = String(pgTxt[p] || '').split(/\r?\n/);
+    const hits = [];
+    for (const ln of lines) {
+      const m = entryRe.exec(ln);
+      if (!m) continue;
+      const title = m[1].replace(/[.…·⋯\-]+$/, '').trim();
+      const printed = parseInt(m[2], 10);
+      if (!title || printed < 1 || printed > Math.max(pages, 1)) continue;
+      hits.push({ title: title, printed: printed });
+    }
+    let mono = true;
+    for (let i = 1; i < hits.length; i++) if (hits[i].printed < hits[i - 1].printed - 2) { mono = false; break; }
+    pageHits.push({ page: p, hits: mono ? hits : [] });
+  }
+  // 目录页 = 首个 ≥6 条的页，向后并入连续 ≥3 条的页（最多 4 页目录）
+  let start = -1;
+  for (let i = 0; i < pageHits.length; i++) if (pageHits[i].hits.length >= 6) { start = i; break; }
+  if (start < 0) return null;
+  const found = [pageHits[start]];
+  for (let i = start + 1; i < pageHits.length && i <= start + 4; i++) {
+    if (pageHits[i].hits.length >= 3) found.push(pageHits[i]);
+    else break;
+  }
+  // 跨页目录：按 title+printed 去重保序
+  const seen = {}; const entries = []; let tocLastPage = 0;
+  for (const f of found) {
+    tocLastPage = f.page;
+    for (const h of f.hits) {
+      const k = h.title + '@' + h.printed;
+      if (seen[k]) continue;
+      seen[k] = 1; entries.push(h);
+    }
+  }
+  if (entries.length < 6) return null;
+  const sorted = entries.slice().sort((a, b) => a.printed - b.printed);
+  // ② 层级标题识别（见文件头注释②）：短、无 套/卷/题/数字，且与下一条同页
+  const headerSet = {};
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const e = sorted[i], nx = sorted[i + 1];
+    if (e.printed === nx.printed && e.title.length <= 8 && !/[0-9０-９一二三四五六七八九十百两套卷题篇]/.test(e.title)) headerSet[i] = e.title;
+  }
+  const headersFound = Object.keys(headerSet).length > 0;
+  const contentStart = tocLastPage + 1;
+  // 印刷页 → 物理页：默认恒偏移（印刷页码连续编号）；若最大印刷页 + 偏移超出实际页数，
+  // 说明编号不连续（每套卷各自编号等）→ 退化为线性比例映射，保证末章落在最后一页。
+  const minP = sorted[0].printed, maxP = sorted[sorted.length - 1].printed;
+  const offset = Math.max(0, contentStart - minP);
+  const useProp = (maxP + offset) > pages && maxP > minP;
+  const phys = useProp
+    ? function (printed) { return contentStart + Math.round((printed - minP) * (pages - contentStart) / (maxP - minP)); }
+    : function (printed) { return printed + offset; };
+  const chapters = [];
+  let curGroup = '';
+  for (let i = 0; i < sorted.length; i++) {
+    if (headerSet[i] !== undefined) { curGroup = headerSet[i]; continue; }   // 分隔标题不成章
+    let from = phys(sorted[i].printed);
+    let to = i + 1 < sorted.length ? phys(sorted[i + 1].printed) - 1 : pages;
+    if (from < contentStart) from = contentStart;
+    if (from > pages) from = pages;
+    if (to > pages) to = pages;
+    if (to < from) to = from;
+    chapters.push({ title: sorted[i].title.slice(0, 40), printed: sorted[i].printed, from: from, to: to, group: curGroup });
+  }
+  // 去重叠夹逼（印刷页码不连续时相邻章区间可能倒挂）
+  chapters.sort((a, b) => a.from - b.from);
+  for (let i = 0; i < chapters.length; i++) {
+    if (i + 1 < chapters.length && chapters[i].to > chapters[i + 1].to) chapters[i].to = chapters[i + 1].to;
+    if (chapters[i].to < chapters[i].from) chapters.splice(i, 1), i--;
+  }
+  if (chapters.length < 5) return null;
+  return { chapters: chapters.slice(0, 150), headersFound: headersFound, tocLastPage: tocLastPage, entries: sorted };
+}
+
+/* 大类归类校验：AI 给的 groups 必须每个条目恰好落一组，否则全部退回「全册」单组。
+ * ids 为 1-based 条目编号。纯函数。 */
+function validateBookGroups(aiGroups, nEntries) {
+  const out = new Array(nEntries).fill('');
+  if (!Array.isArray(aiGroups) || !aiGroups.length) return out;
+  const used = {};
+  let ok = true;
+  for (const g of aiGroups) {
+    const title = String((g && g.title) || '').trim().slice(0, 12);
+    const ids = Array.isArray(g && g.ids) ? g.ids : null;
+    if (!title || !ids) { ok = false; break; }
+    for (const idRaw of ids) {
+      const id = parseInt(idRaw, 10) - 1;
+      if (isNaN(id) || id < 0 || id >= nEntries || used[id]) { ok = false; break; }
+      used[id] = 1; out[id] = title;
+    }
+    if (!ok) break;
+    if (out.filter(Boolean).length > 12 * nEntries) { ok = false; break; }   // 防幻觉冗余
+  }
+  if (!ok || used[0] === undefined) return new Array(nEntries).fill('');
+  for (let i = 0; i < nEntries; i++) if (!out[i]) return new Array(nEntries).fill('');
+  return out;
+}
+
+/* 从 chapters[].group 推导书级 groups 列表（顺序=首次出现；组名空 → 「全册」）。纯函数。 */
+function deriveBookGroups(chapters) {
+  const groups = []; const idx = {};
+  (chapters || []).forEach(function (c) {
+    const title = String(c.group || '').trim() || '全册';
+    if (!(title in idx)) { idx[title] = groups.length; groups.push({ title: title, count: 0, qCount: 0 }); }
+    const g = groups[idx[title]];
+    g.count++; g.qCount += (c.questions || []).length;
+  });
+  return groups;
+}
+
 async function runImport(gist, job, prefs) {
   const subj = prefs.subject && prefs.subject !== 'auto' ? prefs.subject : (prefs.importSubject || 'math');
   // ---------- ① 拉源文件 ----------
@@ -1406,27 +1529,51 @@ async function runImport(gist, job, prefs) {
         const subject = SUBJ_NAME[subj] || subj;
         const imgSet = {}; imgPages.forEach(p => { imgSet[p] = 1; });
         if (garbledN) pushLog('⚠️ ' + garbledN + ' 页文字层乱码（公式字体无 ToUnicode），对应章节将走整页视觉识别');
-        await setStatus('running', 'parsing', '🗂 AI 划分章节结构…', 15);
-        const digest = [];
-        for (let p = 1; p <= pages; p++) {
-          const t = String(pgTxt[p] || '').replace(/\s+/g, ' ').trim();
-          if (t.length >= 40) digest.push('P' + p + ': ' + t.slice(0, 110));
+        await setStatus('running', 'parsing', '🗂 解析目录结构…', 15);
+        // 【v18 两级目录】结构来源优先级：① 书自带目录页（确定性解析，套卷名/页码零猜测）→ AI 只做「大类归类」；
+        //   ② 无目录页 → AI 逐页摘要划分（习题合集时每套卷一章，≤150 章）。
+        let chapters = null, structSrc = '';
+        const toc = extractBookToc(pgTxt, pages);
+        if (toc && toc.chapters.length) {
+          chapters = toc.chapters;
+          structSrc = '📑 目录页（第 1-' + toc.tocLastPage + ' 页，' + toc.entries.length + ' 条）';
+          pushLog('📑 识别到目录页：' + toc.entries.length + ' 个条目 → ' + chapters.length + ' 个小类（章），页码按目录精确切分' + (toc.headersFound ? '（含层级标题，大类已确定性归组）' : ''));
+          // 大类归类：目录页自带「入门/进阶/难」这类层级标题时解析阶段已分组；否则一次轻量 AI 调用。
+          // AI 失败/输出不合法 → 全部归「全册」，结构仍然可用。
+          if (!toc.headersFound) try {
+            const gc = await aiJson(
+              [{ role: 'system', content: '我会给出资料目录里的条目列表（编号. 标题）。请按内容把它们归入「大类」——通常是难度层级（如 入门/基础/进阶/强化/冲刺/难）或系列名（如 张宇八套卷/李林四套卷）；若条目本就是同一层级的一组试卷，可整体归为 1 个大类（组名概括书的内容，如 "模拟卷"）。只输出 JSON：{"groups":[{"title":"大类名(≤12字)","ids":[条目编号]}]}。要求：每个编号恰好属于一组、不重不漏；≤12 个大类。' },
+               { role: 'user', content: '【条目】\n' + toc.entries.map((e, i) => (i + 1) + '. ' + e.title).join('\n').slice(0, 12000) + '\n\n请归类。' }],
+              { think: false, temperature: 0.2, maxTokens: 4000 });
+            const groupNames = validateBookGroups(gc && gc.groups, chapters.length);
+            if (groupNames.some(Boolean)) {
+              chapters.forEach((c, i) => { c.group = groupNames[i]; });
+              pushLog('🏷 大类归类：' + deriveBookGroups(chapters).map(g => g.title + '(' + g.count + ')').join(' · '));
+            }
+          } catch (e) { pushLog('⚠️ 大类归类失败（' + String(e.message || e).slice(0, 80) + '），全部归入「全册」', 'warn'); }
+        } else {
+          structSrc = 'AI 划分';
+          const digest = [];
+          for (let p = 1; p <= pages; p++) {
+            const t = String(pgTxt[p] || '').replace(/\s+/g, ' ').trim();
+            if (t.length >= 40) digest.push('P' + p + ': ' + t.slice(0, 110));
+          }
+          if (digest.length < 3) throw new Error('可读文字页过少（' + digest.length + ' 页）——纯扫描版 PDF 暂不支持整本导入，可按章拍照分批处理');
+          const outline = await aiJson(
+            [{ role: 'system', content: '你是教材结构分析专家。根据一份资料的逐页摘要（P页码: 内容首行）划分章节结构。只输出 JSON：{"chapters":[{"title":"章节名(≤40字)","from":起始页,"to":结束页,"group":"所属大类(≤12字，没有则留空)"}]}。要求：2-150 个章节；页码范围连续、不重叠、覆盖全部有内容的页。粒度=书的一级目录（章/讲），不要拆到小节。【特例】若这份资料是「多套试卷/习题的合集」（每套 2-6 页、标题形如 XX五套卷第N套 / 模拟卷N），则每一套卷单独成章（title 用套卷全名，如 "2024余炳森五套卷第3套"），并按难度层级或系列给出 group（如 入门/进阶/难；同书同层级时 group 可留空）。' },
+             { role: 'user', content: '【逐页摘要】（共 ' + pages + ' 页）\n' + digest.join('\n') + '\n\n请划分章节。' }],
+            { think: false, temperature: 0.2, maxTokens: JOB_MAXTOK });
+          chapters = (Array.isArray(outline.chapters) ? outline.chapters : [])
+            .map(c => ({ title: String((c && c.title) || '未命名章节').slice(0, 40), from: Math.max(1, Number(c && c.from) || 1), to: Math.min(pages, Number(c && c.to) || 1), group: String((c && c.group) || '').trim().slice(0, 12) }))
+            .filter(c => c.to >= c.from).slice(0, 150);
+          if (!chapters.length) throw new Error('AI 未划分出有效章节');
         }
-        if (digest.length < 3) throw new Error('可读文字页过少（' + digest.length + ' 页）——纯扫描版 PDF 暂不支持整本导入，可按章拍照分批处理');
-        const outline = await aiJson(
-          [{ role: 'system', content: '你是教材结构分析专家。根据一份资料的逐页摘要（P页码: 内容首行）划分章节结构。只输出 JSON：{"chapters":[{"title":"章节名(≤24字)","from":起始页,"to":结束页}]}。要求：2-30 个章节；页码范围连续、覆盖全部有内容的页；粒度=书的一级目录（章/讲），不要拆到小节。' },
-           { role: 'user', content: '【逐页摘要】（共 ' + pages + ' 页）\n' + digest.join('\n') + '\n\n请划分章节。' }],
-          { think: false, temperature: 0.2, maxTokens: JOB_MAXTOK });
-        const chapters = (Array.isArray(outline.chapters) ? outline.chapters : [])
-          .map(c => ({ title: String((c && c.title) || '未命名章节').slice(0, 24), from: Math.max(1, Number(c && c.from) || 1), to: Math.min(pages, Number(c && c.to) || 1) }))
-          .filter(c => c.to >= c.from).slice(0, 30);
-        if (!chapters.length) throw new Error('AI 未划分出有效章节');
-        pushLog('🗂 章节划分：' + chapters.length + ' 章（' + chapters.map(c => c.from + '-' + c.to).join('，') + '）');
+        pushLog('🗂 章节划分（' + structSrc + '）：' + chapters.length + ' 章 · ' + (chapters.some(c => c.group) ? chapters.length + ' 个小类 / ' + deriveBookGroups(chapters).length + ' 个大类' : '单层级'));
 
-        // ② 分章提取（并发 2）：要点段落 + 题目，每章独立落盘
+        // ② 分章提取（并发 3）：要点段落 + 题目，每章独立落盘
         const out = [];
         let done = 0;
-        await pool(chapters, 2, async (ch, ci) => {
+        await pool(chapters, 3, async (ch, ci) => {
           await cancelCheckpoint();
           const ps = []; for (let p = ch.from; p <= ch.to; p++) ps.push(p);
           const visN = ps.filter(p => imgSet[p]).length;
@@ -1468,22 +1615,24 @@ async function runImport(gist, job, prefs) {
             };
           }).filter(q => q.stem);
           if (!content.length && !questions.length) return;
-          out.push({ id: 'ch' + (ci + 1), title: (ch.title || '章节').slice(0, 24), from: ch.from, to: ch.to, content: content, questions: questions });
+          out.push({ id: 'ch' + (ci + 1), title: (ch.title || '章节').slice(0, 40), from: ch.from, to: ch.to, group: String(ch.group || '').slice(0, 12), content: content, questions: questions });
           done++;
           await setStatus('running', 'extracting', '📖 已提取 ' + done + '/' + chapters.length + ' 章 · ' + ch.title, 20 + Math.round(done / chapters.length * 70));
         }, (d, n) => { });
         out.sort((a, b) => a.from - b.from);
         const qTotal = out.reduce((a, c) => a + c.questions.length, 0);
         if (!out.length) throw new Error('全部章节提取失败（模型未产出有效内容）——可重试或换模型');
+        const groups = deriveBookGroups(out);
         const book = {
           id: (job.jobId || 'book') + '-book',
           title: (String(prefs.bookTitle || '').trim() || '未命名资料').slice(0, 60),
           kind: (prefs.bookKind === '习题册' ? '习题册' : '讲义'),
           subject: subject,
           chapters: out, chapterCount: out.length, questionCount: qTotal,
+          groups: groups,
           basedOnPages: pages, builtBy: 'book-import', generatedAt: new Date().toISOString()
         };
-        pushLog('✅ 整本提取完成：' + out.length + ' 章 · ' + qTotal + ' 题');
+        pushLog('✅ 整本提取完成：' + out.length + ' 章 · ' + qTotal + ' 题' + (groups.length > 1 || groups[0].title !== '全册' ? '（' + groups.length + ' 个大类：' + groups.map(g => g.title + ' ' + g.count + ' 章').join(' / ') + '）' : ''));
         dropPendingStatus();
         await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
           'result.json': { content: JSON.stringify({ builtBy: 'book-import', book: book }) },
