@@ -131,8 +131,8 @@ async function readSourceBuffer(files, tag) {
 }
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
-// 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复）。
-const RUNNER_VER = 'v16';
+// 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
+const RUNNER_VER = 'v17';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1154,7 +1154,13 @@ function pageIsGarbled(txt) {
   const s = String(txt || '').replace(/\s+/g, '');
   if (s.length < 30) return false;
   const pua = puaCount(txt);
-  return pua > 30 || pua / s.length > 0.03;
+  if (pua > 30 || pua / s.length > 0.03) return true;
+  // 【v17 数学乱码信号】字体无 ToUnicode 映射时，pdftotext 把公式字形输出成 🟥/□/■/U+FFFD
+  // 这类替换字符——它们不是 PUA，旧检测全漏（李林四套卷实测：每页 10+ 个 🟥、积分/分式
+  // 全碎成「n2+1」，但文字层"看起来"正常，被喂给文本模型提取出垃圾）。
+  // 出现 ≥6 个或占比 >0.8% 即判乱码 → 转视觉整页识别。
+  const boxy = (String(txt).match(/[\u{1F7E5}\u{1F7E6}\u{1F7E7}\u{1F7E8}□■▯]/gu) || []).length;
+  return boxy >= 6 || boxy / s.length > 0.008;
 }
 function importTextSystem(subj) {
   return '你是考研' + subjName(subj) + '试卷数字化工程师。用户给你一份试卷其中几页的文字层提取（pdftotext 输出，'
@@ -1238,6 +1244,17 @@ function bookChapterSystem(subject, kind) {
     + '{"content":["讲义要点段落1","段落2",…],"questions":[{"stem":"题目原文","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
     + '要求：1) content 提炼本章真正的知识内容（定义/定理/方法/结论/例题讲解），每段≤300字，按原文顺序，公式用 $…$ LaTeX；'
     + '2) questions 提取原文中出现的例题与习题（保留题号），没有题目就给空数组；3) 忠实原文，禁止编造原文没有的内容；4) 用简体中文。';
+}
+
+function bookChapterVisionSystem(subject, kind) {
+  const kn = kind === '习题册' ? '习题册' : '讲义';
+  return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文页面图片（公式密集，文字层不可靠，故走整页视觉识别）。'
+    + '请产出本章的结构化学习内容，只输出 JSON（不要 markdown 围栏）：'
+    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"stem":"题目原文","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
+    + '要求：1) content 提炼本章真正的知识内容（定义/定理/方法/结论/例题讲解），每段≤300字，按原文顺序，公式用 $…$ LaTeX；'
+    + '2) questions 提取图片中出现的例题与习题（保留题号），没有题目就给空数组；'
+    + '3) 数学公式必须用 LaTeX（$…$）准确还原（分式/根号/上下标/积分号）；'
+    + '4) 忠实原文，禁止编造原文没有的内容；5) 用简体中文。';
 }
 
 async function runImport(gist, job, prefs) {
@@ -1380,9 +1397,15 @@ async function runImport(gist, job, prefs) {
        *   ① AI 目录划分（整本 → 章节页码范围，2-30 章）
        *   ② 分章提取（并发 2）：讲义要点段落 + 例题/习题（题干/答案/解析）
        *   ③ book.json（结构 = studyBook 记录）→ 前端资料库阅读
-       * v1 边界：仅处理文字层页；乱码/扫描页跳过并记录（电子讲义/习题册绝大多数是文字层 PDF）。 */
+       * 【v17 视觉通道】公式密集型 PDF（做题本/讲义）文字层被 pdftotext 压碎（🟥/分式碎裂），
+       *   这类页已判乱码转视觉——分章提取按章决策：视觉页过半 → 整章走 2 页/次视觉识别合并；
+       *   否则走文字层。旧 v1「仅处理文字层页、乱码页跳过」对数学资料等于丢内容。 */
       if (prefs.mode === 'book') {
-        if (garbledN) pushLog('⚠️ ' + garbledN + ' 页乱码/扫描页跳过（资料库 v1 仅处理文字层页）');
+        // 【v17 致命修复】subject 此前未定义（runImport 开头是 subj）——book 分支一进
+        // 分章提取就 ReferenceError，整条链路从未真正跑通过。中文科目名供提示词用。
+        const subject = SUBJ_NAME[subj] || subj;
+        const imgSet = {}; imgPages.forEach(p => { imgSet[p] = 1; });
+        if (garbledN) pushLog('⚠️ ' + garbledN + ' 页文字层乱码（公式字体无 ToUnicode），对应章节将走整页视觉识别');
         await setStatus('running', 'parsing', '🗂 AI 划分章节结构…', 15);
         const digest = [];
         for (let p = 1; p <= pages; p++) {
@@ -1405,16 +1428,37 @@ async function runImport(gist, job, prefs) {
         let done = 0;
         await pool(chapters, 2, async (ch, ci) => {
           await cancelCheckpoint();
-          let text = '';
-          for (let p = ch.from; p <= ch.to; p++) text += '\n【P' + p + '】\n' + String(pgTxt[p] || '');
-          text = text.trim().slice(0, 24000);
-          if (!text) return;
-          const res = await aiJson(
-            [{ role: 'system', content: bookChapterSystem(subject, prefs.bookKind) },
-             { role: 'user', content: '【章节】' + ch.title + '（原文页 ' + ch.from + '-' + ch.to + '）\n【原文】\n' + text + '\n\n请按系统规约提取本章讲义要点与题目，只输出 JSON。' }],
-            { think: false, temperature: 0.3, maxTokens: 16000 });
-          const content = (Array.isArray(res.content) ? res.content : []).map(x => String(x || '').trim().slice(0, 500)).filter(Boolean).slice(0, 30);
-          const questions = (Array.isArray(res.questions) ? res.questions : []).slice(0, 30).map(function (q, qi) {
+          const ps = []; for (let p = ch.from; p <= ch.to; p++) ps.push(p);
+          const visN = ps.filter(p => imgSet[p]).length;
+          let res = { content: [], questions: [] };
+          if (visN * 2 >= ps.length) {
+            // 视觉为主（公式页/扫描页占比过半）：整章逐 2 页转图识别，合并各次产出
+            for (let i = 0; i < ps.length; i += 2) {
+              const chunk = ps.slice(i, i + 2);
+              const pngs = await renderPageImgs(chunk);
+              if (!pngs.length) continue;
+              const vr = await aiJson(
+                [{ role: 'system', content: bookChapterVisionSystem(subject, prefs.bookKind) },
+                 { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + ' · 整页图片）\n请按系统规约提取本页讲义要点与题目，只输出 JSON。' }] }
+                   .concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } })))],
+                { think: false, temperature: 0.3, maxTokens: 16000 });
+              if (Array.isArray(vr.content)) res.content = res.content.concat(vr.content);
+              if (Array.isArray(vr.questions)) res.questions = res.questions.concat(vr.questions);
+            }
+            if (!res.content.length && !res.questions.length) return;
+          } else {
+            // 文字为主（原路径）
+            let text = '';
+            for (const p of ps) text += '\n【P' + p + '】\n' + String(pgTxt[p] || '');
+            text = text.trim().slice(0, 24000);
+            if (!text) return;
+            res = await aiJson(
+              [{ role: 'system', content: bookChapterSystem(subject, prefs.bookKind) },
+               { role: 'user', content: '【章节】' + ch.title + '（原文页 ' + ch.from + '-' + ch.to + '）\n【原文】\n' + text + '\n\n请按系统规约提取本章讲义要点与题目，只输出 JSON。' }],
+              { think: false, temperature: 0.3, maxTokens: 16000 });
+          }
+          const content = (Array.isArray(res.content) ? res.content : []).map(x => String(x || '').trim().slice(0, 500)).filter(Boolean).slice(0, 40);
+          const questions = (Array.isArray(res.questions) ? res.questions : []).slice(0, 60).map(function (q, qi) {
             return {
               id: 'bq' + ci + '_' + qi,
               stem: String((q && q.stem) || '').trim().slice(0, 600),
@@ -1672,7 +1716,11 @@ async function runImport(gist, job, prefs) {
     const subj = prefs.subject === 'auto' ? 'math' : (prefs.subject || 'math');   // auto 由规划阶段自行判断科目语境
     JOB_SUBJ = subj;
     // 【v10 导入通道】prefs.mode==='import' → 走 PDF/图片识别流水线，与出卷流水线平行
-    if (prefs.mode === 'import') {
+    // 【v17 致命修复·资料库】book 模式也必须进 runImport——book 分支就写在 runImport 里面，
+    //   旧入口只认 'import'，mode='book' 的任务直接掉进出卷管线（用户实测：四套卷 90+ 题
+    //   被当成数一蓝本出了 22 道新题，日志全是「并发出题/总审查/定向重写」）。
+    //   回归测试：tests/core/cloudjob-repo.test.ts「book 分发」守门断言。
+    if (prefs.mode === 'import' || prefs.mode === 'book') {
       await runImport(gist, job, prefs);
       return;
     }
