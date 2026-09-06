@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v18';
+const RUNNER_VER = 'v20';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1237,24 +1237,56 @@ function normalizeImported(q, g) {
     fromImport: true, importKind: g.kind, importNote: validateImported(q) || ''
   };
 }
+/* 【v20 完整性铁律】22 题的卷子只提回 17 题事故：模型对长解答卷会「抽样偷懒」。
+ * schema 强制 num（原题号），规约要求题号连续覆盖——审计函数据此找缺口，缺则定向补提。 */
+const BOOK_Q_COMPLETE_RULE = '【完整性铁律——最重要】必须输出本章全部题目，一题不落：'
+  + '每题的 num 填原文题号（数字），输出前自查题号是否从最小号连续覆盖到最大号；'
+  + '题干再长、解析再繁也不许省略或概括——宁可 solution 写简，不可丢题。原文没有的题号不许编造。';
 function bookChapterSystem(subject, kind) {
   const kn = kind === '习题册' ? '习题册' : '讲义';
   return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文（文字层提取，可能有排版噪声）。'
     + '请产出本章的结构化学习内容，只输出 JSON（不要 markdown 围栏）：'
-    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"stem":"题目原文","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
+    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"num":原题号数字,"stem":"题目原文(不重复题号前缀)","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
     + '要求：1) content 提炼本章真正的知识内容（定义/定理/方法/结论/例题讲解），每段≤300字，按原文顺序，公式用 $…$ LaTeX；'
-    + '2) questions 提取原文中出现的例题与习题（保留题号），没有题目就给空数组；3) 忠实原文，禁止编造原文没有的内容；4) 用简体中文。';
+    + '2) questions 提取原文中出现的例题与习题，没有题目就给空数组；3) 忠实原文，禁止编造原文没有的内容；4) 用简体中文。'
+    + BOOK_Q_COMPLETE_RULE;
 }
 
 function bookChapterVisionSystem(subject, kind) {
   const kn = kind === '习题册' ? '习题册' : '讲义';
   return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文页面图片（公式密集，文字层不可靠，故走整页视觉识别）。'
     + '请产出本章的结构化学习内容，只输出 JSON（不要 markdown 围栏）：'
-    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"stem":"题目原文","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
+    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"num":原题号数字,"stem":"题目原文(不重复题号前缀)","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
     + '要求：1) content 提炼本章真正的知识内容（定义/定理/方法/结论/例题讲解），每段≤300字，按原文顺序，公式用 $…$ LaTeX；'
-    + '2) questions 提取图片中出现的例题与习题（保留题号），没有题目就给空数组；'
+    + '2) questions 提取图片中出现的例题与习题，没有题目就给空数组；'
     + '3) 数学公式必须用 LaTeX（$…$）准确还原（分式/根号/上下标/积分号）；'
-    + '4) 忠实原文，禁止编造原文没有的内容；5) 用简体中文。';
+    + '4) 忠实原文，禁止编造原文没有的内容；5) 用简体中文。'
+    + BOOK_Q_COMPLETE_RULE;
+}
+
+/* 【v20 缺题审计】题号集合 → 1..max 中的缺口列表。纯函数（可单测）。
+ * 无题号/题号<3 不审计（习题册节选本就跳号）；缺口>30 视为题号混乱不可信，不触发补提。 */
+function auditGapNums(questions) {
+  const found = {};
+  (questions || []).forEach(function (q) {
+    const n = parseInt(q && q.num, 10);
+    if (n >= 1 && n <= 80) found[n] = 1;
+  });
+  const ks = Object.keys(found).map(Number);
+  if (!ks.length) return [];
+  const maxN = Math.max.apply(null, ks);
+  if (maxN < 3) return [];
+  const miss = [];
+  for (let n = 1; n <= maxN; n++) if (!found[n]) miss.push(n);
+  return miss.length > 30 ? [] : miss;
+}
+
+/* 【v20 定向补提规约】只找缺失题号——比首轮「全部重提」便宜且准。 */
+function bookRepairSystem(chTitle, missList) {
+  return '你是考研资料数字化专家。《' + chTitle + '》此前已提取过题目，但缺以下题号：' + missList.join('、') + '。'
+    + '请在原文（文字或图片）中只找这些题号的题目，逐字转录。只输出 JSON：'
+    + '{"questions":[{"num":题号,"stem":"题干全文(公式用$…$LaTeX)","options":["A. ..",…]或省略,"answer":"答案","solution":"解析"}]}。'
+    + '原文确实没有的题号（跳号、只有答案没有题目、或属于下一套卷）就跳过，严禁编造。找不到任何缺失题就输出 {"questions":[]}。';
 }
 
 /* 【v18 两级目录·确定性解析器】「85 套卷」这类多卷合集书的正确结构 = 大类（入门/进阶/难/系列）→ 小类（每套卷一章）。
@@ -1305,8 +1337,14 @@ function extractBookToc(pgTxt, pages) {
     }
   }
   if (entries.length < 6) return null;
+  return tocEntriesToChapters(entries, tocLastPage, pages);
+}
+
+/* 【v20.1 共享】目录条目 → 章节（层级标题归组 + 印刷页→物理页校准 + 区间夹逼）。
+ * 文字层解析（extractBookToc）与视觉读目录（extractBookTocVision）共用，保证两条路产出同构。纯函数。 */
+function tocEntriesToChapters(entries, tocLastPage, pages) {
   const sorted = entries.slice().sort((a, b) => a.printed - b.printed);
-  // ② 层级标题识别（见文件头注释②）：短、无 套/卷/题/数字，且与下一条同页
+  // ② 层级标题识别：短、无 套/卷/题/数字，且与下一条同页
   const headerSet = {};
   for (let i = 0; i < sorted.length - 1; i++) {
     const e = sorted[i], nx = sorted[i + 1];
@@ -1342,6 +1380,32 @@ function extractBookToc(pgTxt, pages) {
   }
   if (chapters.length < 5) return null;
   return { chapters: chapters.slice(0, 150), headersFound: headersFound, tocLastPage: tocLastPage, entries: sorted };
+}
+
+/* 【v20.1 视觉读目录】乱码书（做题本/公式讲义）的目录页文字层同样是 🟥——文字解析拿不到条目，
+ * 退回 AI 逐页摘要划分时，AI 看不清套卷边界，会把 85 套卷捏成 13 章（P3-34 这种 32 页「一套卷」）。
+ * 目录页的套卷名是中文（不是公式），视觉识别准确率高 → 渲染前几页让模型抄目录。
+ * 返回 {chapters, headersFound, tocLastPage, entries}（与 extractBookToc 同构）或 null。
+ * 依赖注入（renderPageImgs/aiJson）保持纯逻辑可测。 */
+async function extractBookTocVision(deps) {
+  const { pages, renderPageImgs, aiJson } = deps;
+  const frontN = Math.min(pages, 4);
+  const plist = []; for (let p = 1; p <= frontN; p++) plist.push(p);
+  const pngs = await renderPageImgs(plist);
+  if (!pngs.length) return null;
+  const r = await aiJson(
+    [{ role: 'system', content: '你是目录识别专家。给你的图片是一本书的前几页（按顺序编号 1..N）。若其中有目录页（一列「标题 …… 页码」），把每一条目录项逐字抄下来，并给出目录所在的最后一页的编号；没有目录页就返回 tocFound:false。只输出 JSON：{"tocFound":true/false,"tocLastPage":目录最后一页的图片编号,"entries":[{"title":"目录条目标题原文","printed":条目右侧页码数字}]}。' },
+     { role: 'user', content: [{ type: 'text', text: '这些是全书前 ' + frontN + ' 页。请找目录并抄全部条目（含页码）。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+    { think: false, temperature: 0.1, maxTokens: 12000 });
+  if (!r || !r.tocFound || !Array.isArray(r.entries)) return null;
+  const entries = r.entries
+    .map(e => ({ title: String((e && e.title) || '').trim().slice(0, 40), printed: parseInt(e && e.printed, 10) }))
+    .filter(e => e.title && e.printed >= 1 && e.printed <= Math.max(pages, 1));
+  if (entries.length < 5) return null;
+  // 目录结束页：模型报的编号（图片序=物理页）；异常值兜底为前几页的一半
+  let tocLastPage = parseInt(r.tocLastPage, 10);
+  if (!(tocLastPage >= 1 && tocLastPage <= frontN)) tocLastPage = Math.max(1, Math.min(frontN, 2));
+  return tocEntriesToChapters(entries, tocLastPage, pages);
 }
 
 /* 大类归类校验：AI 给的 groups 必须每个条目恰好落一组，否则全部退回「全册」单组。
@@ -1501,7 +1565,9 @@ async function runImport(gist, job, prefs) {
           const base = pathT.join(wd, 'pg' + p);
           const r = await runShell('pdftoppm -f ' + p + ' -l ' + p + ' -png -r 150 ' + JSON.stringify(pdfPath) + ' ' + JSON.stringify(base), 90000);
           if (!r.ok) { pushLog('⚠️ 第 ' + p + ' 页转图失败：' + String(r.err).slice(0, 120), 'warn'); continue; }
-          for (const f of fsT.readdirSync(wd).filter(x => x.indexOf('pg' + p) === 0 && /\.png$/.test(x))) {
+          // 【v19 致命修复】前缀必须带 '-'：旧版 indexOf('pg'+p)===0 让第 1 页同时命中
+          // pg10~pg16（2 页组实际塞 8 张图 → payload 暴涨/网关拒收）。pg{p}- 才是精确匹配。
+          for (const f of fsT.readdirSync(wd).filter(x => x.indexOf('pg' + p + '-') === 0 && /\.png$/.test(x))) {
             const data = fsT.readFileSync(pathT.join(wd, f));
             if (data.length > 2.6 * 1024 * 1024) { pushLog('⚠️ 第 ' + p + ' 页图 ' + Math.round(data.length / 1048576) + 'MB 过大，跳过', 'warn'); continue; }
             out.push('data:image/png;base64,' + data.toString('base64'));
@@ -1509,10 +1575,14 @@ async function runImport(gist, job, prefs) {
         }
         return out;
       }
-      for (let i = 0; i < imgPages.length; i += 2) {
-        const chunk = imgPages.slice(i, i + 2);
-        const pngs = await renderPageImgs(chunk);
-        if (pngs.length) groups.push({ kind: 'img', imgs: pngs, pages: chunk });
+      // 【v19】book 模式跳过这次预渲染：groups 对 book 无用（分章提取自己按页转图），
+      //   旧版白烧 16 次 pdftoppm 还留下满目录 pg*.png 诱发前缀误匹配 bug。
+      if (prefs.mode !== 'book') {
+        for (let i = 0; i < imgPages.length; i += 2) {
+          const chunk = imgPages.slice(i, i + 2);
+          const pngs = await renderPageImgs(chunk);
+          if (pngs.length) groups.push({ kind: 'img', imgs: pngs, pages: chunk });
+        }
       }
 
       /* 【2026-09-06 资料库·book 分支】讲义/习题册整本导入：
@@ -1531,12 +1601,21 @@ async function runImport(gist, job, prefs) {
         if (garbledN) pushLog('⚠️ ' + garbledN + ' 页文字层乱码（公式字体无 ToUnicode），对应章节将走整页视觉识别');
         await setStatus('running', 'parsing', '🗂 解析目录结构…', 15);
         // 【v18 两级目录】结构来源优先级：① 书自带目录页（确定性解析，套卷名/页码零猜测）→ AI 只做「大类归类」；
-        //   ② 无目录页 → AI 逐页摘要划分（习题合集时每套卷一章，≤150 章）。
+        //   ②【v20.1】目录页文字层也乱码 → 视觉读目录（套卷名是中文，视觉识别可靠）；
+        //   ③ 都没有目录 → AI 逐页摘要划分（习题合集时每套卷一章，≤150 章）。
         let chapters = null, structSrc = '';
-        const toc = extractBookToc(pgTxt, pages);
+        let toc = extractBookToc(pgTxt, pages);
+        if (!toc && (prefs.bookKind === '习题册' || imgPages.length * 2 >= pages)) {
+          // 前 4 页过半是乱码/扫描页 → 目录页文字层不可用，值得花一次视觉调用读目录
+          try {
+            pushLog('📷 目录页文字层不可用，转视觉读目录…');
+            toc = await extractBookTocVision({ pages: pages, renderPageImgs: renderPageImgs, aiJson: aiJson });
+            if (toc) { toc.viaVision = true; pushLog('📷 视觉目录读取成功：' + toc.entries.length + ' 条'); }
+          } catch (e) { pushLog('⚠️ 视觉读目录失败（' + String((e && e.message) || e).slice(0, 100) + '），退回 AI 划分', 'warn'); toc = null; }
+        }
         if (toc && toc.chapters.length) {
           chapters = toc.chapters;
-          structSrc = '📑 目录页（第 1-' + toc.tocLastPage + ' 页，' + toc.entries.length + ' 条）';
+          structSrc = (toc.viaVision ? '📷 视觉读目录' : '📑 目录页') + '（第 1-' + toc.tocLastPage + ' 页，' + toc.entries.length + ' 条）';
           pushLog('📑 识别到目录页：' + toc.entries.length + ' 个条目 → ' + chapters.length + ' 个小类（章），页码按目录精确切分' + (toc.headersFound ? '（含层级标题，大类已确定性归组）' : ''));
           // 大类归类：目录页自带「入门/进阶/难」这类层级标题时解析阶段已分组；否则一次轻量 AI 调用。
           // AI 失败/输出不合法 → 全部归「全册」，结构仍然可用。
@@ -1570,29 +1649,64 @@ async function runImport(gist, job, prefs) {
         }
         pushLog('🗂 章节划分（' + structSrc + '）：' + chapters.length + ' 章 · ' + (chapters.some(c => c.group) ? chapters.length + ' 个小类 / ' + deriveBookGroups(chapters).length + ' 个大类' : '单层级'));
 
-        // ② 分章提取（并发 3）：要点段落 + 题目，每章独立落盘
+        // 【v19 视觉能力预检】李林做题本事故根因：乱码书全部走视觉，而文本模型挂在宽容网关后时
+        // 会「静默丢图」——模型没收到任何图片却照常回 {"content":[],"questions":[]}，
+        // 旧版把空结果当正常跳过（无日志），最终只剩一句「模型未产出有效内容」，用户无从下手。
+        // 现在开跑前用首页做一次 3 行小测：读不出图上文字 = 模型不支持视觉，立即中止并给出换模型指引。
+        const visHeavy = pages > 0 && imgPages.length * 2 >= pages;
+        if (visHeavy) {
+          await setStatus('running', 'parsing', '👁 视觉能力预检…', 16);
+          try {
+            const probePages = imgPages.slice(0, 2);   // 首页可能是纯封面：带第 2 页，任一页读出文字即通过
+            const t1 = await renderPageImgs(probePages);
+            if (!t1.length) throw new Error('首页转图失败（pdftoppm 无产出）');
+            const probe = await aiJson(
+              [{ role: 'system', content: '你是视觉能力探针。给你资料页面图片，只输出 JSON：{"lines":["图中能读到的前 3 行文字原文"]}' },
+               { role: 'user', content: [{ type: 'text', text: '请逐字读出第一张图片最靠上的 3 行文字（若全是公式或无文字，读第二张图的标题行；都没有则返回空数组）。' }].concat(t1.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+              { think: false, temperature: 0, maxTokens: 600 });
+            const got = Array.isArray(probe && probe.lines) ? probe.lines.filter(l => String(l).trim().length >= 2) : [];
+            if (!got.length) throw new Error('模型对图片返回空内容（典型症状：网关丢弃了图片段 / 模型不支持图片输入）');
+            pushLog('👁 视觉预检通过：模型能读图（示例识别：「' + String(got[0]).slice(0, 24) + '」）');
+          } catch (e) {
+            throw new Error('视觉预检失败——这本书 ' + imgPages.length + '/' + pages + ' 页文字层不可用，整本必须靠视觉模型提取。'
+              + '当前模型读不了图（' + String((e && e.message) || e).slice(0, 140) + '）。'
+              + '出路：到 设置→AI 把模型换成支持图片输入的视觉模型（如 GLM-4V-Plus / Qwen-VL-Max / GPT-4o / gemini-2.5-flash），保存后回到 ☁️ 云端任务点「♻️ 重发」。');
+          }
+        }
+
+        // ② 分章提取（并发 3）：要点段落 + 题目，每章独立落盘；【v20】题号审计 + 缺题定向补提
         const out = [];
-        let done = 0;
-        await pool(chapters, 3, async (ch, ci) => {
+        let done = 0, emptyN = 0, repairedN = 0;
+        const poolRes = await pool(chapters, 3, async (ch, ci) => {
           await cancelCheckpoint();
           const ps = []; for (let p = ch.from; p <= ch.to; p++) ps.push(p);
           const visN = ps.filter(p => imgSet[p]).length;
+          const wasVision = visN * 2 >= ps.length;
           let res = { content: [], questions: [] };
-          if (visN * 2 >= ps.length) {
-            // 视觉为主（公式页/扫描页占比过半）：整章逐 2 页转图识别，合并各次产出
-            for (let i = 0; i < ps.length; i += 2) {
-              const chunk = ps.slice(i, i + 2);
+          if (wasVision) {
+            // 视觉为主（公式页/扫描页占比过半）：整章转图识别，合并各次产出。
+            // 【v20 滑窗重叠】旧版逐 2 页硬切：一道解答题跨页边（P103→P104）会被两次调用各砍一半，
+            //   模型两头都提不全 → 全书系统性漏题。改为 3 页窗口步进 2（相邻窗口共享 1 页），
+            //   跨页题至少完整出现在一个窗口里；合并时按题号去重、保留信息更全的那份。
+            const chunks = [];
+            if (ps.length <= 3) chunks.push(ps.slice());
+            else for (let i = 0; i < ps.length; i += 2) chunks.push(ps.slice(i, Math.min(i + 3, ps.length)));
+            for (const chunk of chunks) {
+              if (!chunk.length) continue;
               const pngs = await renderPageImgs(chunk);
-              if (!pngs.length) continue;
+              if (!pngs.length) { pushLog('⚠️ 《' + ch.title + '》第 ' + chunk.join('、') + ' 页转图无产出，该窗口跳过', 'warn'); continue; }
               const vr = await aiJson(
                 [{ role: 'system', content: bookChapterVisionSystem(subject, prefs.bookKind) },
-                 { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + ' · 整页图片）\n请按系统规约提取本页讲义要点与题目，只输出 JSON。' }] }
-                   .concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } })))],
-                { think: false, temperature: 0.3, maxTokens: 16000 });
+                 { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + ' · 整页图片）\n第一步：先数清楚这几页上一共出现了哪些题号；第二步：逐题输出，一题不落。只输出 JSON。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+                { think: false, temperature: 0.2, maxTokens: 16000 });
               if (Array.isArray(vr.content)) res.content = res.content.concat(vr.content);
               if (Array.isArray(vr.questions)) res.questions = res.questions.concat(vr.questions);
             }
-            if (!res.content.length && !res.questions.length) return;
+            if (!res.content.length && !res.questions.length) {
+              emptyN++;
+              pushLog('⚠️ 《' + ch.title + '》视觉提取返回空（预检虽过，模型对这几页没读出内容——可重试或换更强的视觉模型）', 'warn');
+              return;
+            }
           } else {
             // 文字为主（原路径）
             let text = '';
@@ -1605,15 +1719,77 @@ async function runImport(gist, job, prefs) {
               { think: false, temperature: 0.3, maxTokens: 16000 });
           }
           const content = (Array.isArray(res.content) ? res.content : []).map(x => String(x || '').trim().slice(0, 500)).filter(Boolean).slice(0, 40);
-          const questions = (Array.isArray(res.questions) ? res.questions : []).slice(0, 60).map(function (q, qi) {
-            return {
-              id: 'bq' + ci + '_' + qi,
-              stem: String((q && q.stem) || '').trim().slice(0, 600),
-              options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => String(o || '').slice(0, 120)) : undefined,
-              answer: String((q && q.answer) || '').trim().slice(0, 200),
-              solution: String((q && q.solution) || '').trim().slice(0, 800),
-            };
-          }).filter(q => q.stem);
+          // 【v20】num 兜底：模型漏给 num 时从题干前缀「18.」「18、」解析原题号
+          function normQs(list, tag) {
+            return (Array.isArray(list) ? list : []).map(function (q, qi) {
+              const stem = String((q && q.stem) || '').trim().slice(0, 900);
+              let n = parseInt(q && q.num, 10);
+              if (!(n >= 1)) { const m = stem.match(/^\s*(\d{1,2})\s*[.、．]/); n = m ? parseInt(m[1], 10) : 0; }
+              return {
+                id: 'bq' + ci + '_' + tag + qi,
+                num: n >= 1 && n <= 80 ? n : undefined,
+                stem: stem,
+                options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => String(o || '').slice(0, 120)) : undefined,
+                answer: String((q && q.answer) || '').trim().slice(0, 200),
+                solution: String((q && q.solution) || '').trim().slice(0, 800),
+              };
+            }).filter(q => q.stem);
+          }
+          // 滑窗重叠会让同一题号出现两份：按 num 去重，保留题干+解析更全的那份
+          function dedupeByNum(list) {
+            const byNum = {}, noNum = [];
+            list.forEach(function (q) {
+              if (!q.num) { noNum.push(q); return; }
+              const old = byNum[q.num];
+              const rich = (q.stem || '').length + (q.solution || '').length;
+              if (!old || rich > (old.stem || '').length + (old.solution || '').length) byNum[q.num] = q;
+            });
+            return Object.keys(byNum).map(Number).sort(function (a, b) { return a - b; }).map(function (n) { return byNum[n]; }).concat(noNum);
+          }
+          let questions = dedupeByNum(normQs(res.questions, '')).slice(0, 80);
+          // 【v20 缺题审计+定向补提】题号 1..max 有洞 → 拿原文（同通道）只补缺洞题号。
+          //   最多两轮：模型第一轮偷懒漏了，第二轮拿「已提取题号清单」逼它只补缺口；
+          //   某轮一题都没补回来 → 判定原文确实没有，停止（防无限烧调用）。
+          for (let round = 0; round < 2; round++) {
+            const miss = auditGapNums(questions);
+            if (!miss.length) break;
+            try {
+              pushLog('🩹 《' + ch.title + '》题号审计缺 ' + miss.length + ' 题（' + miss.join('、') + '），第 ' + (round + 1) + ' 轮定向补提…');
+              const got = [];
+              if (wasVision) {
+                for (let i = 0; i < ps.length; i += 4) {
+                  const chunk = ps.slice(i, i + 4);
+                  const pngs = await renderPageImgs(chunk);
+                  if (!pngs.length) continue;
+                  const rr = await aiJson(
+                    [{ role: 'system', content: bookRepairSystem(ch.title, miss) },
+                     { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + ' · 整页图片）\n只输出缺失题号的题目 JSON。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+                    { think: false, temperature: 0.2, maxTokens: 12000 });
+                  if (Array.isArray(rr.questions)) got.push.apply(got, rr.questions);
+                }
+              } else {
+                let text = '';
+                for (const p of ps) text += '\n【P' + p + '】\n' + String(pgTxt[p] || '');
+                const rr = await aiJson(
+                  [{ role: 'system', content: bookRepairSystem(ch.title, miss) },
+                   { role: 'user', content: '【章节】' + ch.title + '（原文页 ' + ch.from + '-' + ch.to + '）\n【原文】\n' + text.trim().slice(0, 24000) + '\n\n只输出缺失题号的题目 JSON。' }],
+                  { think: false, temperature: 0.2, maxTokens: 12000 });
+                if (Array.isArray(rr.questions)) got.push.apply(got, rr.questions);
+              }
+              const have = {}; questions.forEach(q => { if (q.num) have[q.num] = 1; });
+              let added = 0;
+              normQs(got, 'r' + round).forEach(function (q) {
+                if (q.num && miss.indexOf(q.num) >= 0 && !have[q.num]) { questions.push(q); have[q.num] = 1; added++; }
+              });
+              if (added) {
+                repairedN += added;
+                questions.sort(function (a, b) { return (a.num || 999) - (b.num || 999); });
+              }
+              const still = auditGapNums(questions);
+              if (!still.length) { pushLog('✅ 《' + ch.title + '》补提成功（+' + added + ' 题），题号已连续覆盖'); break; }
+              if (!added) { pushLog('⚠️ 《' + ch.title + '》补提后仍缺 ' + still.join('、') + '（两轮无新增，判定原文跳号/图不清，停止补提）', 'warn'); break; }
+            } catch (e) { pushLog('⚠️ 《' + ch.title + '》补提失败（' + String((e && e.message) || e).slice(0, 100) + '），保留已提取部分', 'warn'); break; }
+          }
           if (!content.length && !questions.length) return;
           out.push({ id: 'ch' + (ci + 1), title: (ch.title || '章节').slice(0, 40), from: ch.from, to: ch.to, group: String(ch.group || '').slice(0, 12), content: content, questions: questions });
           done++;
@@ -1621,7 +1797,14 @@ async function runImport(gist, job, prefs) {
         }, (d, n) => { });
         out.sort((a, b) => a.from - b.from);
         const qTotal = out.reduce((a, c) => a + c.questions.length, 0);
-        if (!out.length) throw new Error('全部章节提取失败（模型未产出有效内容）——可重试或换模型');
+        if (!out.length) {
+          // 【v19】pool 把 worker 异常只记进 results[i].__err（console），用户端日志此前全盲。
+          // 最终失败必须带第一个真实错误，否则「模型未产出有效内容」永远猜不动根因。
+          const firstErr = (poolRes || []).find(r => r && r.__err);
+          throw new Error('全部章节提取失败（' + chapters.length + ' 章：' + emptyN + ' 章返回空' + (firstErr ? '，' + chapters.length - emptyN + ' 章报错' : '') + '）'
+            + (firstErr ? '。首个错误：' + String(firstErr.__err).slice(0, 220) : '')
+            + '——视觉书请确认用的是支持图片输入的模型（GLM-4V/Qwen-VL/GPT-4o 等），换模型后点「♻️ 重发」');
+        }
         const groups = deriveBookGroups(out);
         const book = {
           id: (job.jobId || 'book') + '-book',
@@ -1632,7 +1815,7 @@ async function runImport(gist, job, prefs) {
           groups: groups,
           basedOnPages: pages, builtBy: 'book-import', generatedAt: new Date().toISOString()
         };
-        pushLog('✅ 整本提取完成：' + out.length + ' 章 · ' + qTotal + ' 题' + (groups.length > 1 || groups[0].title !== '全册' ? '（' + groups.length + ' 个大类：' + groups.map(g => g.title + ' ' + g.count + ' 章').join(' / ') + '）' : ''));
+        pushLog('✅ 整本提取完成：' + out.length + ' 章 · ' + qTotal + ' 题' + (repairedN ? '（含审计补提 ' + repairedN + ' 题）' : '') + (groups.length > 1 || groups[0].title !== '全册' ? '（' + groups.length + ' 个大类：' + groups.map(g => g.title + ' ' + g.count + ' 章').join(' / ') + '）' : ''));
         dropPendingStatus();
         await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
           'result.json': { content: JSON.stringify({ builtBy: 'book-import', book: book }) },
