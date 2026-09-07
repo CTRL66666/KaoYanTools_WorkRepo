@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v28';
+const RUNNER_VER = 'v30';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -535,14 +535,43 @@ function jsonRepairEscapes(t) {
     .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u')
     .replace(/\\(["\\\/bfnrtu]|u[0-9a-fA-F]{4})|\\(.)/g, function (m, ok, bad) { return ok !== undefined ? m : '\\\\' + bad; });
 }
+/* 【v30 控制字符修复】模型常把题干写成跨行（JSON 字符串里塞裸换行/制表符），
+ * JSON.parse 报 "Expected ',' or '}' after property value"（李林卷一/卷二实测）。
+ * 逐字符扫描，仅在字符串内部把 0x00-0x1F 转义成 \n \r \t \uXXXX。 */
+function jsonEscapeControlInStrings(t) {
+  let out = '', inStr = false, esc = false;
+  const s = String(t || '');
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) { out += c; esc = false; continue; }
+      if (c === '\\') { out += c; esc = true; continue; }
+      if (c === '"') { out += c; inStr = false; continue; }
+      const code = c.charCodeAt(0);
+      if (code < 0x20) {
+        if (c === '\n') out += '\\n';
+        else if (c === '\r') out += '\\r';
+        else if (c === '\t') out += '\\t';
+        else out += '\\u' + ('000' + code.toString(16)).slice(-4);
+      } else out += c;
+    } else { out += c; if (c === '"') inStr = true; }
+  }
+  return out;
+}
+/* 【v30 解析链】原样 → 修反斜杠转义 → 修控制字符 → 两者都修，逐级放宽。 */
+function jsonParseLoose(x) {
+  const cands = [x, jsonRepairEscapes(x), jsonEscapeControlInStrings(x), jsonEscapeControlInStrings(jsonRepairEscapes(x))];
+  let lastErr = null;
+  for (const c of cands) { try { return JSON.parse(c); } catch (e) { lastErr = e; } }
+  throw lastErr;
+}
 function extractJson(txt) {
   let t = String(txt || '')
     .replace(/<think>[\s\S]*?<\/think>/gi, '')   // 思考模型的显式思考块
     .replace(/<think>[\s\S]*$/i, '')             // 未闭合的思考块（后面不会再有正文了）
     .trim();
   t = t.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/g, '').trim();
-  try { return JSON.parse(t); } catch (e) {}
-  try { return JSON.parse(jsonRepairEscapes(t)); } catch (e) {}   // 【v23】LaTeX 非法转义修复后重试
+  try { return jsonParseLoose(t); } catch (e) {}   // 【v30】四重修复链（转义+控制字符）
   const starts = [t.indexOf('{'), t.indexOf('[')].filter(i => i >= 0);
   if (!starts.length) throw new Error('输出中没有 JSON（原始输出前 160 字：' + t.slice(0, 160).replace(/\s+/g, ' ') + '）');
   const s = Math.min(...starts);
@@ -557,7 +586,7 @@ function extractJson(txt) {
       depth--;
       if (!depth) {
         const seg = t.slice(s, i + 1);
-        try { return JSON.parse(seg); } catch (e) { return JSON.parse(jsonRepairEscapes(seg)); }   // 【v23】段内同样先修转义
+        return jsonParseLoose(seg);   // 【v30】段内同样走四重修复链
       }
     }
   }
