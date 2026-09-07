@@ -29,7 +29,7 @@ for (const [i, b] of BOOKS.entries()) {
   const jid = 'zt' + ts + '_' + i;
   const job = { ver: 1, jobId: jid, prefs: { subject: 'math', mode: 'book', think: false, bookTitle: b.title, bookKind: '习题册', importKind: '习题册', fileName: b.fileName, importTitle: b.title, importTimeLimit: 180, fillAnswers: false, ai }, createdAt: new Date().toISOString() };
   const tg = await api('POST', '/gists', { description: '[kaoyan2026] exam-import ' + jid, public: false, files: { 'job.json': { content: JSON.stringify(job) } } });
-  await api('POST', '/repos/CTRL66666/KaoYanTools_WorkRepo/actions/workflows/ai-exam.yml/dispatches', { ref: 'main', inputs: { gist_id: tg.id, resource_gist_id: ag.id } });
+  await api('POST', '/repos/CTRL66666/KaoYanTools_WorkRepo/actions/workflows/ai-exam.yml/dispatches', { ref: 'main', inputs: { gist_id: tg.id, resource_gist_id: assetId } });
   console.log('TASK_GIST ' + jid + ' task=' + tg.id + ' asset=' + assetId + ' ' + b.title);
   await new Promise(r => setTimeout(r, 4000));
 }
