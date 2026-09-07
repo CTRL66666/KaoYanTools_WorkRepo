@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v27';
+const RUNNER_VER = 'v28';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -2044,20 +2044,32 @@ async function runImport(gist, job, prefs) {
             const chunks = [];
             if (ps.length <= 2) chunks.push(ps.slice());
             else for (let i = 0; i < ps.length; i += 1) chunks.push(ps.slice(i, i + 2));
-            for (const chunk of chunks) {
-              if (!chunk.length) continue;
-              if (!budgetOk('《' + ch.title + '》P' + chunk.join('+'))) break;
-              const pngs = await renderPageImgs(chunk);
-              if (!pngs.length) { pushLog('⚠️ 《' + ch.title + '》第 ' + chunk.join('、') + ' 页转图无产出，该窗口跳过', 'warn'); continue; }
-              // 【v21 双通道】文字层随图附上做汉字校对（乱码书它多半是噪声，规约已教模型忽略）
-              let layerTxt = '';
-              for (const p of chunk) layerTxt += '\n【P' + p + '】' + String(pgTxt[p] || '').slice(0, 3000);
-              const vr = await aiJson(
-                [{ role: 'system', content: bookChapterVisionSystem(subject, prefs.bookKind) },
-                 { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + (is2up ? ' · 每物理页已裁左右半页' : ' · 整页图片') + '）\n【该页文字层（仅校对汉字数字，公式以图为准）】' + (layerTxt.trim().slice(0, 6000) || '（无）') + '\n第一步：先数清楚这几页上一共出现了哪些题号；第二步：逐题输出，一题不落。只输出 JSON。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-                { think: false, temperature: 0.2, maxTokens: 16000 });
-              if (Array.isArray(vr.content)) res.content = res.content.concat(vr.content);
-              if (Array.isArray(vr.questions)) res.questions = res.questions.concat(vr.questions);
+            // 【v28 0 题整章重试】模型对某些页偶发乱码/吐 0 题（李林卷三实测），审计只补「题号有洞」
+            //   补不到「整章 0 题」。故窗口全跑完仍 0 题 → 整章窗口重试一次（乱码是瞬时的）。
+            async function runVisionWindows() {
+              const acc = { content: [], questions: [] };
+              for (const chunk of chunks) {
+                if (!chunk.length) continue;
+                if (!budgetOk('《' + ch.title + '》P' + chunk.join('+'))) break;
+                const pngs = await renderPageImgs(chunk);
+                if (!pngs.length) { pushLog('⚠️ 《' + ch.title + '》第 ' + chunk.join('、') + ' 页转图无产出，该窗口跳过', 'warn'); continue; }
+                // 【v21 双通道】文字层随图附上做汉字校对（乱码书它多半是噪声，规约已教模型忽略）
+                let layerTxt = '';
+                for (const p of chunk) layerTxt += '\n【P' + p + '】' + String(pgTxt[p] || '').slice(0, 3000);
+                const vr = await aiJson(
+                  [{ role: 'system', content: bookChapterVisionSystem(subject, prefs.bookKind) },
+                   { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + (is2up ? ' · 每物理页已裁左右半页' : ' · 整页图片') + '）\n【该页文字层（仅校对汉字数字，公式以图为准）】' + (layerTxt.trim().slice(0, 6000) || '（无）') + '\n第一步：先数清楚这几页上一共出现了哪些题号；第二步：逐题输出，一题不落。只输出 JSON。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+                  { think: false, temperature: 0.2, maxTokens: 16000 });
+                if (Array.isArray(vr.content)) acc.content = acc.content.concat(vr.content);
+                if (Array.isArray(vr.questions)) acc.questions = acc.questions.concat(vr.questions);
+              }
+              return acc;
+            }
+            res = await runVisionWindows();
+            if (!res.questions.length && res.content.length < 4) {
+              pushLog('🩹 《' + ch.title + '》首轮 0 题（模型疑似乱码/漏读），整章重试一次…');
+              const retry = await runVisionWindows();
+              if (retry.questions.length) res = retry;
             }
             if (!res.content.length && !res.questions.length) {
               emptyN++;
