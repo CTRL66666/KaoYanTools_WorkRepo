@@ -14,18 +14,23 @@ const src = await (await fetch('https://api.github.com/gists/7b42e4cf69d3cd06698
 const ai = JSON.parse(src.files['job.json'].content).prefs.ai;
 console.log('AI config loaded: model=' + ai.model);
 const BOOKS = [
-  { title: '贾基八十五套卷 数学一', file: 'test_pdfs/jiaji_a3_math1.pdf', fileName: '[A3][数学一][紧凑版] 贾基八十五套卷.pdf' },
-  { title: '贾基八十五套卷 数学二', file: 'test_pdfs/jiaji_k16_math2.pdf', fileName: '[K16] 贾基八十五套卷 [数学二] [compact](1).pdf' },
+  { title: '李林四套卷 数学一（做题本）', file: 'test_pdfs/lilin_math1.pdf', fileName: '【无间隙】李林四套卷数一做题本.pdf', asset: '00161fb75eecb6d29d3ca165ca17985f' },
+  { title: '贾基八十五套卷 数学一', file: 'test_pdfs/jiaji_a3_math1.pdf', fileName: '[A3][数学一][紧凑版] 贾基八十五套卷.pdf', asset: '50d4fd2eae8d00be680791c88621ac7c' },
+  { title: '贾基八十五套卷 数学二', file: 'test_pdfs/jiaji_k16_math2.pdf', fileName: '[K16] 贾基八十五套卷 [数学二] [compact](1).pdf', asset: '008868923db7e70572e3c9ce7aee0ad7' },
 ];
 const ts = Date.now();
 for (const [i, b] of BOOKS.entries()) {
-  const raw = fs.readFileSync(b.file);
-  const ag = await api('POST', '/gists', { description: '[kaoyan2026] exam-import-asset zt' + ts + '_' + i + ' ' + b.fileName, public: false, files: { 'source.pdf.b64': { content: raw.toString('base64') } } });
+  let assetId = b.asset;
+  if (!assetId) {
+    const raw = fs.readFileSync(b.file);
+    const ag = await api('POST', '/gists', { description: '[kaoyan2026] exam-import-asset zt' + ts + '_' + i + ' ' + b.fileName, public: false, files: { 'source.pdf.b64': { content: raw.toString('base64') } } });
+    assetId = ag.id;
+  }
   const jid = 'zt' + ts + '_' + i;
   const job = { ver: 1, jobId: jid, prefs: { subject: 'math', mode: 'book', think: false, bookTitle: b.title, bookKind: '习题册', importKind: '习题册', fileName: b.fileName, importTitle: b.title, importTimeLimit: 180, fillAnswers: false, ai }, createdAt: new Date().toISOString() };
   const tg = await api('POST', '/gists', { description: '[kaoyan2026] exam-import ' + jid, public: false, files: { 'job.json': { content: JSON.stringify(job) } } });
   await api('POST', '/repos/CTRL66666/KaoYanTools_WorkRepo/actions/workflows/ai-exam.yml/dispatches', { ref: 'main', inputs: { gist_id: tg.id, resource_gist_id: ag.id } });
-  console.log('TASK_GIST ' + jid + ' task=' + tg.id + ' asset=' + ag.id + ' ' + b.title);
+  console.log('TASK_GIST ' + jid + ' task=' + tg.id + ' asset=' + assetId + ' ' + b.title);
   await new Promise(r => setTimeout(r, 4000));
 }
 console.log('LAUNCH DONE');
