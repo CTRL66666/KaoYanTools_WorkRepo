@@ -14,6 +14,7 @@ const src = await (await fetch('https://api.github.com/gists/7b42e4cf69d3cd06698
 const ai = JSON.parse(src.files['job.json'].content).prefs.ai;
 console.log('AI config loaded: model=' + ai.model);
 const BOOKS = [
+  { title: '李林四套卷 数学一（做题本）', file: 'test_pdfs/lilin_math1.pdf', fileName: '【无间隙】李林四套卷数一做题本.pdf', asset: '00161fb75eecb6d29d3ca165ca17985f' },
   { title: '贾基八十五套卷 数学一', file: 'test_pdfs/jiaji_a3_math1.pdf', fileName: '[A3][数学一][紧凑版] 贾基八十五套卷.pdf', asset: '50d4fd2eae8d00be680791c88621ac7c' },
   { title: '贾基八十五套卷 数学二', file: 'test_pdfs/jiaji_k16_math2.pdf', fileName: '[K16] 贾基八十五套卷 [数学二] [compact](1).pdf', asset: '008868923db7e70572e3c9ce7aee0ad7' },
 ];
