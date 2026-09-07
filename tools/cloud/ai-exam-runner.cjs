@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v24';
+const RUNNER_VER = 'v25';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1640,51 +1640,58 @@ function halfCropArgs(pageWpt, pageHpt, dpi, half) {
   return { x: x, y: 0, w: w, h: hpx };
 }
 
-/* 【v21 R1 / v24 换 fitz】读 PDF 书签：临时脚本 + python3。
- * 【v24 根因】pypdf 对贾基/李林这类 LaTeX 生成的 outline 返回空列表（fitz 实测能读 95/189/16 条）
- *   ——v23 贾基因此静默降级到页脚路线，章节标题全是页脚残留。改为 PyMuPDF(fitz) 主、pypdf 备。
- * 缺库 → pip 自救（PEP 668 用 --break-system-packages）；仍失败返回 null（调用方落 R2/R3/R4 路线）。
- * 返回 [[level,title,page1based],...] 或 null。 */
+/* 【v21 R1 / v24 换 fitz / v25 修自救触发】读 PDF 书签：临时脚本 + python3。
+ * 【v25 根因】v24 脚本 fitz 缺失时静默 fall 到 pypdf，pypdf 对 LaTeX outline 返回空 [] →
+ *   r.ok=true → pip 自救（装 pymupdf）永不触发 → 书签路线形同虚设（贾基靠改进后的页脚路线救回，
+ *   李林无页脚 → 宫格只找到 1 套）。修复：fitz 缺失或 pypdf 返回空都 exit 43 触发自救装 pymupdf 重试。
+ * 返回 [[level,title,page1based],...] 或 null（调用方落 R2/R3/R4 路线）。 */
 async function readPdfBookmarks(pdfPath) {
   const py = [
     'import sys, json',
-    'out = []',
-    'try:',
+    'def read_fitz():',
     '    import fitz',
     '    d = fitz.open(sys.argv[1])',
-    '    out = [[int(t[0]), str(t[1])[:60], int(t[2])] for t in d.get_toc()]',
-    '    print(json.dumps(out, ensure_ascii=False))',
-    '    sys.exit(0)',
+    '    return [[int(t[0]), str(t[1])[:60], int(t[2])] for t in d.get_toc()]',
+    'def read_pypdf():',
+    '    from pypdf import PdfReader',
+    '    r = PdfReader(sys.argv[1]); out = []',
+    '    def walk(items, lv):',
+    '        for it in items:',
+    '            if isinstance(it, list):',
+    '                walk(it, lv + 1)',
+    '            else:',
+    '                try:',
+    '                    pg = r.get_destination_page_number(it) + 1',
+    '                except Exception:',
+    '                    pg = 0',
+    '                out.append([lv, str(it.title or "")[:60], pg])',
+    '    try:',
+    '        walk(r.outline, 1)',
+    '    except Exception:',
+    '        pass',
+    '    return out',
+    '# 1) fitz 优先（对 LaTeX 生成的 outline 可靠）。缺库 → exit 43 触发 pip 装 pymupdf。',
+    'try:',
+    '    print(json.dumps(read_fitz(), ensure_ascii=False)); sys.exit(0)',
     'except ImportError:',
-    '    pass',
+    '    sys.exit(43)',
     'except Exception as e:',
     '    print("FITZERR:" + str(e), file=sys.stderr)',
+    '# 2) pypdf 兜底：非空才可信；空 → exit 43（多半是 fitz 缺失的降级，装 pymupdf 重试更值）',
     'try:',
-    '    from pypdf import PdfReader',
+    '    res = read_pypdf()',
+    '    if res:',
+    '        print(json.dumps(res, ensure_ascii=False)); sys.exit(0)',
+    '    sys.exit(43)',
     'except Exception:',
-    '    sys.exit(42)',
-    'r = PdfReader(sys.argv[1])',
-    'def walk(items, lv):',
-    '    for it in items:',
-    '        if isinstance(it, list):',
-    '            walk(it, lv + 1)',
-    '        else:',
-    '            try:',
-    '                pg = r.get_destination_page_number(it) + 1',
-    '            except Exception:',
-    '                pg = 0',
-    '            out.append([lv, str(it.title or "")[:60], pg])',
-    'try:',
-    '    walk(r.outline, 1)',
-    'except Exception:',
-    '    pass',
-    'print(json.dumps(out, ensure_ascii=False))',
+    '    sys.exit(43)',
   ].join('\n');
   const f = pathT.join(osT.tmpdir(), 'bm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.py');
   try { fsT.writeFileSync(f, py, 'utf8'); } catch (e) { return null; }
   let r = await runShell('python3 ' + JSON.stringify(f) + ' ' + JSON.stringify(pdfPath), 30000, 8 * 1024 * 1024);
-  if (!r.ok && /42|ModuleNotFoundError|No module named/.test(String(r.err) + String(r.out))) {
-    pushLog('🐍 PDF 解析库未装，尝试 pip 自救（pymupdf→pypdf）…');
+  // exit 42/43 或模块缺失 → pip 自救装 pymupdf（pypdf 兜底），再跑一次
+  if ((!r.ok && /4[23]|ModuleNotFoundError|No module named/.test(String(r.err) + String(r.out))) || (r.ok && String(r.out).trim().endsWith('[]'))) {
+    pushLog('🐍 书签读取需 pymupdf（fitz 缺失或 pypdf 返空），pip 自救…');
     // Ubuntu 24.04 runner 是 externally-managed（PEP 668）：普通 pip install 会被拒。
     // 依次尝试 --break-system-packages（系统级）→ --user（用户级），任一成功即可。
     for (const pkg of ['pymupdf', 'pypdf']) {
