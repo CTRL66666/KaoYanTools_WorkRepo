@@ -9,9 +9,9 @@ async function api(m, p, b) {
   if (!t || r.status === 204) return {};   // dispatches 返回 204 空体
   return JSON.parse(t);
 }
-// AI 配置：从用户既有任务 Gist 取 prefs.ai（带 token 认证，避免匿名限流）
-const src = await api('GET', '/gists/7b42e4cf69d3cd066980efbac6a6dfd3');
-const ai = JSON.parse(src.files['job.json'].content).prefs.ai;
+// AI 配置：从 workflow dispatch inputs（env）读，避免依赖会被清理的历史 gist
+const ai = { endpoint: process.env.AI_ENDPOINT, model: process.env.AI_MODEL, key: process.env.AI_KEY };
+if (!ai.endpoint || !ai.key) throw new Error('AI_* env 缺失');
 console.log('AI config loaded: model=' + ai.model);
 const BOOKS = [
   { title: '李林四套卷 数学一（做题本）', file: 'test_pdfs/lilin_math1.pdf', fileName: '【无间隙】李林四套卷数一做题本.pdf', asset: '00161fb75eecb6d29d3ca165ca17985f' },
