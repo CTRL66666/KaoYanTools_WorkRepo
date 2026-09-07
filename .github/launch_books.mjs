@@ -6,6 +6,7 @@ async function api(m, p, b) {
   const r = await fetch('https://api.github.com' + p, { method: m, headers: H, body: b ? JSON.stringify(b) : undefined });
   const t = await r.text();
   if (!r.ok) throw new Error(m + ' ' + p + ' -> ' + r.status + ' ' + t.slice(0, 300));
+  if (!t || r.status === 204) return {};   // dispatches 返回 204 空体
   return JSON.parse(t);
 }
 // AI 配置：从用户既有任务 Gist（secret gist 凭 URL 可读）取 prefs.ai
@@ -13,7 +14,6 @@ const src = await (await fetch('https://api.github.com/gists/7b42e4cf69d3cd06698
 const ai = JSON.parse(src.files['job.json'].content).prefs.ai;
 console.log('AI config loaded: model=' + ai.model);
 const BOOKS = [
-  { title: '李林四套卷 数学一（做题本）', file: 'test_pdfs/lilin_math1.pdf', fileName: '【无间隙】李林四套卷数一做题本.pdf' },
   { title: '贾基八十五套卷 数学一', file: 'test_pdfs/jiaji_a3_math1.pdf', fileName: '[A3][数学一][紧凑版] 贾基八十五套卷.pdf' },
   { title: '贾基八十五套卷 数学二', file: 'test_pdfs/jiaji_k16_math2.pdf', fileName: '[K16] 贾基八十五套卷 [数学二] [compact](1).pdf' },
 ];
