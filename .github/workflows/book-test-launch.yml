@@ -1,6 +1,16 @@
 name: Book Test Launcher
 on:
   workflow_dispatch:
+    inputs:
+      ai_endpoint:
+        description: 'AI endpoint'
+        required: true
+      ai_model:
+        description: 'AI model'
+        required: true
+      ai_key:
+        description: 'AI key'
+        required: true
 jobs:
   launch:
     runs-on: ubuntu-latest
@@ -10,7 +20,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Launch three book jobs
+      - name: Launch book jobs
         env:
           GH_TOKEN: ${{ secrets.CLOUDJOB_GH_TOKEN }}
+          AI_ENDPOINT: ${{ github.event.inputs.ai_endpoint }}
+          AI_MODEL: ${{ github.event.inputs.ai_model }}
+          AI_KEY: ${{ github.event.inputs.ai_key }}
         run: node .github/launch_books.mjs
