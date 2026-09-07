@@ -46,6 +46,11 @@ jobs:
       - name: Install sympy
         run: pip install sympy
 
+      # 【v29】PyMuPDF(fitz)：资料库书签直拆（R1）依赖它读 PDF outline。pypdf 对 LaTeX 生成的
+      # outline 返回空，fitz 可靠；运行时 pip 自救不稳（时好时坏降级到宫格），故在 workflow 预装。
+      - name: Install pymupdf (资料库书签直拆)
+        run: pip install pymupdf
+
       # 【v11 PDF 导入】poppler-utils（pdfinfo / pdftotext / pdftoppm）——解析试卷必需的三个命令行工具。
       # 踩坑实证（2026-09-02）：ubuntu-latest **并未预装** poppler-utils，缺它时导入任务会在
       # 「已拉到源文件之后」直接崩 pdfinfo: not found。这里显式安装（约 10~20s，Actions runner 有免密 sudo）。
