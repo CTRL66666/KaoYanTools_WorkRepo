@@ -1,0 +1,16 @@
+name: Book Test Launcher
+on:
+  workflow_dispatch:
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Launch three book jobs
+        env:
+          GH_TOKEN: ${{ secrets.CLOUDJOB_GH_TOKEN }}
+        run: node .github/launch_books.mjs
