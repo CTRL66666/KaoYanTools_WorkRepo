@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v30';
+const RUNNER_VER = 'v31';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1291,7 +1291,10 @@ function normalizeImported(q, g) {
  * schema 强制 num（原题号），规约要求题号连续覆盖——审计函数据此找缺口，缺则定向补提。 */
 const BOOK_Q_COMPLETE_RULE = '【完整性铁律——最重要】必须输出本章全部题目，一题不落：'
   + '每题的 num 填原文题号（数字），输出前自查题号是否从最小号连续覆盖到最大号；'
-  + '题干再长、解析再繁也不许省略或概括——宁可 solution 写简，不可丢题。原文没有的题号不许编造。';
+  + '题干再长、解析再繁也不许省略或概括——宁可 solution 写简，不可丢题。原文没有的题号不许编造。'
+  + '【LaTeX 书写】公式命令与其花括号/参数连续书写，命令之间禁止插入多余空格'
+  + '（写 $\\dfrac{1}{x}$、$\\lim\\limits_{x\\to+\\infty}$、$\\begin{cases}$，不要写成 \\dfrac {1} {x} 或 \\begin {cases}）；'
+  + '反斜杠命令必须完整（\\begin 不能漏成 \\egin），下标上标紧贴符号。';
 function bookChapterSystem(subject, kind) {
   const kn = kind === '习题册' ? '习题册' : '讲义';
   return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文（文字层提取，可能有排版噪声）。'
@@ -2075,8 +2078,11 @@ async function runImport(gist, job, prefs) {
             else for (let i = 0; i < ps.length; i += 1) chunks.push(ps.slice(i, i + 2));
             // 【v28 0 题整章重试】模型对某些页偶发乱码/吐 0 题（李林卷三实测），审计只补「题号有洞」
             //   补不到「整章 0 题」。故窗口全跑完仍 0 题 → 整章窗口重试一次（乱码是瞬时的）。
-            async function runVisionWindows() {
+            async function runVisionWindows(focused) {
               const acc = { content: [], questions: [] };
+              const ask = focused
+                ? '【重试·只提取题目】上一轮你可能把整页当成讲义散文塞进了 content、questions 交了白卷。这一轮【只输出 questions 数组】：把这几页上每一道题（含选择/填空/解答的题干、选项、答案、解析）逐题提取，题号填 num，一题不落。content 一律留空。'
+                : '第一步：先数清楚这几页上一共出现了哪些题号；第二步：逐题输出，一题不落。只输出 JSON。';
               for (const chunk of chunks) {
                 if (!chunk.length) continue;
                 if (!budgetOk('《' + ch.title + '》P' + chunk.join('+'))) break;
@@ -2087,18 +2093,24 @@ async function runImport(gist, job, prefs) {
                 for (const p of chunk) layerTxt += '\n【P' + p + '】' + String(pgTxt[p] || '').slice(0, 3000);
                 const vr = await aiJson(
                   [{ role: 'system', content: bookChapterVisionSystem(subject, prefs.bookKind) },
-                   { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + (is2up ? ' · 每物理页已裁左右半页' : ' · 整页图片') + '）\n【该页文字层（仅校对汉字数字，公式以图为准）】' + (layerTxt.trim().slice(0, 6000) || '（无）') + '\n第一步：先数清楚这几页上一共出现了哪些题号；第二步：逐题输出，一题不落。只输出 JSON。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-                  { think: false, temperature: 0.2, maxTokens: 16000 });
+                   { role: 'user', content: [{ type: 'text', text: '【章节】' + ch.title + '（原文页 ' + chunk.join('、') + (is2up ? ' · 每物理页已裁左右半页' : ' · 整页图片') + '）\n【该页文字层（仅校对汉字数字，公式以图为准）】' + (layerTxt.trim().slice(0, 6000) || '（无）') + '\n' + ask + '只输出 JSON。' }].concat(pngs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+                  { think: false, temperature: focused ? 0.1 : 0.2, maxTokens: 16000 });
                 if (Array.isArray(vr.content)) acc.content = acc.content.concat(vr.content);
                 if (Array.isArray(vr.questions)) acc.questions = acc.questions.concat(vr.questions);
               }
               return acc;
             }
-            res = await runVisionWindows();
-            if (!res.questions.length && res.content.length < 4) {
-              pushLog('🩹 《' + ch.title + '》首轮 0 题（模型疑似乱码/漏读），整章重试一次…');
-              const retry = await runVisionWindows();
-              if (retry.questions.length) res = retry;
+            res = await runVisionWindows(false);
+            // 【v31 0 题重试修正】习题册的命根子是题目：只要 questions==0 就聚焦重试一轮，
+            //   不再被「content 塞得很多」挡住（旧条件 content<4 让「要点满、题全空」的章漏网，
+            //   实测约四分之一套卷栽在这）。讲义类仍保留 content<4 门槛（纯笔记 0 题正常）。
+            if (!res.questions.length && (prefs.bookKind === '习题册' || res.content.length < 4)) {
+              pushLog('🩹 《' + ch.title + '》首轮 0 题（模型疑似把题当散文），聚焦重试一轮只逼它出 questions…');
+              const retry = await runVisionWindows(true);
+              if (retry.questions.length) res = { content: res.content.concat(retry.content), questions: retry.questions };
+            }
+            if (!res.questions.length && prefs.bookKind === '习题册') {
+              pushLog('⚠️ 《' + ch.title + '》两轮仍 0 题——该页可能确无题（纯答案页/图不清），保留要点、标记待人工', 'warn');
             }
             if (!res.content.length && !res.questions.length) {
               emptyN++;
@@ -2117,10 +2129,18 @@ async function runImport(gist, job, prefs) {
               { think: false, temperature: 0.3, maxTokens: 16000 });
           }
           const content = (Array.isArray(res.content) ? res.content : []).map(x => String(x || '').trim().slice(0, 500)).filter(Boolean).slice(0, 40);
+          // 【v31 落库前清洗】剥掉漏网的 C0 控制字符（\b 退格=0x08、\f=0x0C 等，来自极少数绕过
+          //   jsonRepairEscapes 的输出）与 U+FFFD 乱码替换符——它们会让前端 KaTeX/文本渲染出黑块/断字。
+          //   保留 \t \n \r（正常排版）。这是兜底网，主修复在 extractJson 的转义链。
+          function cleanCtl(s) {
+            return String(s == null ? '' : s)
+              .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+              .replace(/\uFFFD/g, '');
+          }
           // 【v20】num 兜底：模型漏给 num 时从题干前缀解析原题号——「18.」「18、」「(18)」「（18）」（李林做题本用括号编号）
           function normQs(list, tag) {
             return (Array.isArray(list) ? list : []).map(function (q, qi) {
-              const stem = String((q && q.stem) || '').trim().slice(0, 900);
+              const stem = cleanCtl(q && q.stem).trim().slice(0, 900);
               let n = parseInt(q && q.num, 10);
               if (!(n >= 1)) {
                 const m = stem.match(/^\s*(?:[(（]\s*(\d{1,2})\s*[)）]|(\d{1,2})\s*[.、．])/);
@@ -2131,9 +2151,9 @@ async function runImport(gist, job, prefs) {
                 id: 'bq' + ci + '_' + tag + qi,
                 num: n >= 1 && n <= 80 ? n : undefined,
                 stem: stem,
-                options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => String(o || '').slice(0, 120)) : undefined,
-                answer: String((q && q.answer) || '').trim().slice(0, 200),
-                solution: String((q && q.solution) || '').trim().slice(0, 800),
+                options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => cleanCtl(o).slice(0, 120)) : undefined,
+                answer: cleanCtl((q && q.answer)).trim().slice(0, 200),
+                solution: cleanCtl((q && q.solution)).trim().slice(0, 800),
                 conf: cf >= 0 && cf <= 1 ? Math.round(cf * 100) / 100 : undefined,
               };
             }).filter(q => q.stem);
