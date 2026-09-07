@@ -9,8 +9,8 @@ async function api(m, p, b) {
   if (!t || r.status === 204) return {};   // dispatches 返回 204 空体
   return JSON.parse(t);
 }
-// AI 配置：从用户既有任务 Gist（secret gist 凭 URL 可读）取 prefs.ai
-const src = await (await fetch('https://api.github.com/gists/7b42e4cf69d3cd066980efbac6a6dfd3', { headers: { accept: 'application/vnd.github+json', 'user-agent': 'x' } })).json();
+// AI 配置：从用户既有任务 Gist 取 prefs.ai（带 token 认证，避免匿名限流）
+const src = await api('GET', '/gists/7b42e4cf69d3cd066980efbac6a6dfd3');
 const ai = JSON.parse(src.files['job.json'].content).prefs.ai;
 console.log('AI config loaded: model=' + ai.model);
 const BOOKS = [
