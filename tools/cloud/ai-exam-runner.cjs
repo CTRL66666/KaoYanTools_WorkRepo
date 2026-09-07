@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v22';
+const RUNNER_VER = 'v23';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -521,6 +521,12 @@ async function aiText(messages, opts) {
   return await aiRetry(messages, Object.assign({ think: JOB_THINK }, opts || {}));
 }
 // 宽容 JSON 抽取：剥 <think> 思考块 → 剥代码围栏 → 找首个平衡的 {...} 或 [...]
+/* 【v23 LaTeX 转义修复】模型输出 JSON 字符串里的 LaTeX 命令（\sqrt \delta \frac…）含非法
+ * JSON 转义（\s \d 不在合法集），严格 JSON.parse 必炸——李林四套卷实测
+ * 「Bad escaped character in JSON at position 4247」整章报废。修复：非法 \x 补成合法 \\x。 */
+function jsonRepairEscapes(t) {
+  return String(t).replace(/\\(?!["\\\/bfnrtu])/g, '\\\\');
+}
 function extractJson(txt) {
   let t = String(txt || '')
     .replace(/<think>[\s\S]*?<\/think>/gi, '')   // 思考模型的显式思考块
@@ -528,6 +534,7 @@ function extractJson(txt) {
     .trim();
   t = t.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/g, '').trim();
   try { return JSON.parse(t); } catch (e) {}
+  try { return JSON.parse(jsonRepairEscapes(t)); } catch (e) {}   // 【v23】LaTeX 非法转义修复后重试
   const starts = [t.indexOf('{'), t.indexOf('[')].filter(i => i >= 0);
   if (!starts.length) throw new Error('输出中没有 JSON（原始输出前 160 字：' + t.slice(0, 160).replace(/\s+/g, ' ') + '）');
   const s = Math.min(...starts);
@@ -538,7 +545,13 @@ function extractJson(txt) {
     if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
     if (ch === '"') inStr = true;
     else if (ch === open) depth++;
-    else if (ch === close) { depth--; if (!depth) return JSON.parse(t.slice(s, i + 1)); }
+    else if (ch === close) {
+      depth--;
+      if (!depth) {
+        const seg = t.slice(s, i + 1);
+        try { return JSON.parse(seg); } catch (e) { return JSON.parse(jsonRepairEscapes(seg)); }   // 【v23】段内同样先修转义
+      }
+    }
   }
   throw new Error('JSON 不完整/被截断（输出末尾：…' + t.slice(-100).replace(/\s+/g, ' ') + '）。可尝试调大 max_tokens 或换模型');
 }
@@ -1577,7 +1590,7 @@ function footerAnchorChapters(pgTxt, pages) {
     const m = re.exec(tail);
     if (!m) continue;
     // 页脚里「第1页」之前的文字即套名（去掉水印噪声取 ≤40 字）
-    const name = tail.slice(0, m.index).replace(/[.\s·]+$/, '').trim().slice(-40);
+    const name = tail.slice(0, m.index).replace(/\s+/g, ' ').replace(/[.\s·。]+$/, '').replace(/^[.\s·。]+/, '').trim().slice(-40);
     starts.push({ page: p, title: name || ('第' + (starts.length + 1) + '部分'), total: parseInt(m[1], 10) });
   }
   if (starts.length < 3) return null;
@@ -1655,8 +1668,12 @@ async function readPdfBookmarks(pdfPath) {
   let r = await runShell('python3 ' + JSON.stringify(f) + ' ' + JSON.stringify(pdfPath), 30000, 8 * 1024 * 1024);
   if (!r.ok && /42|ModuleNotFoundError|No module named/.test(String(r.err) + String(r.out))) {
     pushLog('🐍 pypdf 未装，尝试 pip 自救…');
-    await runShell('python3 -m pip install --quiet --disable-pip-version-check pypdf', 120000);
+    // Ubuntu 24.04 runner 是 externally-managed（PEP 668）：普通 pip install 会被拒。
+    // 依次尝试 --break-system-packages（系统级）→ --user（用户级），任一成功即可。
+    const pip1 = await runShell('python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pypdf', 120000);
+    if (!pip1.ok) await runShell('python3 -m pip install --quiet --disable-pip-version-check --user pypdf', 120000);
     r = await runShell('python3 ' + JSON.stringify(f) + ' ' + JSON.stringify(pdfPath), 30000, 8 * 1024 * 1024);
+    if (!r.ok) pushLog('⚠️ 书签读取仍失败（pypdf 自救未成功），本本将退回页脚/目录/宫格路线', 'warn');
   }
   try { fsT.unlinkSync(f); } catch (e) {}
   if (!r.ok) return null;
@@ -1950,7 +1967,8 @@ async function runImport(gist, job, prefs) {
         // 会「静默丢图」——模型没收到任何图片却照常回 {"content":[],"questions":[]}，
         // 旧版把空结果当正常跳过（无日志），最终只剩一句「模型未产出有效内容」，用户无从下手。
         // 现在开跑前用首页做一次 3 行小测：读不出图上文字 = 模型不支持视觉，立即中止并给出换模型指引。
-        const visHeavy = pages > 0 && imgPages.length * 2 >= pages;
+        // 【v23】2-up 书即使乱码页少也全走视觉 → 预检条件同口径
+        const visHeavy = pages > 0 && (imgPages.length * 2 >= pages || !!(RENDER_2UP && RENDER_2UP.pageW > RENDER_2UP.pageH * 1.1));
         if (visHeavy) {
           await setStatus('running', 'parsing', '👁 视觉能力预检…', 16);
           try {
@@ -1979,7 +1997,10 @@ async function runImport(gist, job, prefs) {
           await cancelCheckpoint();
           const ps = []; for (let p = ch.from; p <= ch.to; p++) ps.push(p);
           const visN = ps.filter(p => imgSet[p]).length;
-          const wasVision = visN * 2 >= ps.length;
+          // 【v23】2-up 书强制视觉：pdftotext -layout 把左右两半逐行交织，文字通道喂给模型
+          //   等于乱序阅读（题号/公式串行）；半页裁切图是唯一可靠读法。
+          const is2upBook = !!(RENDER_2UP && RENDER_2UP.pageW > RENDER_2UP.pageH * 1.1);
+          const wasVision = visN * 2 >= ps.length || is2upBook;
           let res = { content: [], questions: [] };
           if (wasVision) {
             // 视觉为主（公式页/扫描页占比过半）：整章转图识别，合并各次产出。
@@ -2111,7 +2132,7 @@ async function runImport(gist, job, prefs) {
           // 【v19】pool 把 worker 异常只记进 results[i].__err（console），用户端日志此前全盲。
           // 最终失败必须带第一个真实错误，否则「模型未产出有效内容」永远猜不动根因。
           const firstErr = (poolRes || []).find(r => r && r.__err);
-          throw new Error('全部章节提取失败（' + chapters.length + ' 章：' + emptyN + ' 章返回空' + (firstErr ? '，' + chapters.length - emptyN + ' 章报错' : '') + '）'
+          throw new Error('全部章节提取失败（' + chapters.length + ' 章：' + emptyN + ' 章返回空' + (firstErr ? '，' + (chapters.length - emptyN) + ' 章报错' : '') + '）'
             + (firstErr ? '。首个错误：' + String(firstErr.__err).slice(0, 220) : '')
             + '——视觉书请确认用的是支持图片输入的模型（GLM-4V/Qwen-VL/GPT-4o 等），换模型后点「♻️ 重发」');
         }
