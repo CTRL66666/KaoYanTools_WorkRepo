@@ -132,7 +132,7 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v23';
+const RUNNER_VER = 'v24';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -525,7 +525,8 @@ async function aiText(messages, opts) {
  * JSON 转义（\s \d 不在合法集），严格 JSON.parse 必炸——李林四套卷实测
  * 「Bad escaped character in JSON at position 4247」整章报废。修复：非法 \x 补成合法 \\x。 */
 function jsonRepairEscapes(t) {
-  return String(t).replace(/\\(?!["\\\/bfnrtu])/g, '\\\\');
+  // 先处理 \u 后不跟 4 位十六进制的（LaTeX \use 等），再处理其余非法转义（\s \d 等）
+  return String(t).replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u').replace(/\\(?!["\\\/bfnrtu])/g, '\\\\');
 }
 function extractJson(txt) {
   let t = String(txt || '')
@@ -1590,7 +1591,11 @@ function footerAnchorChapters(pgTxt, pages) {
     const m = re.exec(tail);
     if (!m) continue;
     // 页脚里「第1页」之前的文字即套名（去掉水印噪声取 ≤40 字）
-    const name = tail.slice(0, m.index).replace(/\s+/g, ' ').replace(/[.\s·。]+$/, '').replace(/^[.\s·。]+/, '').trim().slice(-40);
+    // 【v24】2-up 页脚行混入左右两半的正文：只取尾部像「套卷名」的片段（…第N套/…卷N/…试卷N），
+    //   正文垃圾被标点天然截断；取不到就回退「第N部分」（宁缺毋滥，脏标题比无名更伤体验）
+    const pre = tail.slice(0, m.index).replace(/\s+/g, ' ').trim();
+    const nm = /([0-9A-Za-z一-鿿（）()·\- ]{2,40}?(?:第\s*[0-9一二三四五六七八九十百]+\s*套|[卷套]\s*[0-9一二三四五六七八九十百]+|试卷\s*[0-9一二三四五六七八九十百]+|模拟卷\s*[0-9一二三四五六七八九十百]+))\s*$/.exec(pre);
+    const name = (nm ? nm[1] : '').replace(/^[（）()\s·\-]+/, '').trim().slice(-40);
     starts.push({ page: p, title: name || ('第' + (starts.length + 1) + '部分'), total: parseInt(m[1], 10) });
   }
   if (starts.length < 3) return null;
@@ -1635,18 +1640,30 @@ function halfCropArgs(pageWpt, pageHpt, dpi, half) {
   return { x: x, y: 0, w: w, h: hpx };
 }
 
-/* 【v21 R1】读 PDF 书签（pypdf）：临时脚本 + python3。
- * pypdf 缺失 → pip 自救装一次重试；仍失败返回 null（调用方落 R2/R3/R4 路线）。
+/* 【v21 R1 / v24 换 fitz】读 PDF 书签：临时脚本 + python3。
+ * 【v24 根因】pypdf 对贾基/李林这类 LaTeX 生成的 outline 返回空列表（fitz 实测能读 95/189/16 条）
+ *   ——v23 贾基因此静默降级到页脚路线，章节标题全是页脚残留。改为 PyMuPDF(fitz) 主、pypdf 备。
+ * 缺库 → pip 自救（PEP 668 用 --break-system-packages）；仍失败返回 null（调用方落 R2/R3/R4 路线）。
  * 返回 [[level,title,page1based],...] 或 null。 */
 async function readPdfBookmarks(pdfPath) {
   const py = [
     'import sys, json',
+    'out = []',
+    'try:',
+    '    import fitz',
+    '    d = fitz.open(sys.argv[1])',
+    '    out = [[int(t[0]), str(t[1])[:60], int(t[2])] for t in d.get_toc()]',
+    '    print(json.dumps(out, ensure_ascii=False))',
+    '    sys.exit(0)',
+    'except ImportError:',
+    '    pass',
+    'except Exception as e:',
+    '    print("FITZERR:" + str(e), file=sys.stderr)',
     'try:',
     '    from pypdf import PdfReader',
     'except Exception:',
     '    sys.exit(42)',
     'r = PdfReader(sys.argv[1])',
-    'out = []',
     'def walk(items, lv):',
     '    for it in items:',
     '        if isinstance(it, list):',
@@ -1667,13 +1684,15 @@ async function readPdfBookmarks(pdfPath) {
   try { fsT.writeFileSync(f, py, 'utf8'); } catch (e) { return null; }
   let r = await runShell('python3 ' + JSON.stringify(f) + ' ' + JSON.stringify(pdfPath), 30000, 8 * 1024 * 1024);
   if (!r.ok && /42|ModuleNotFoundError|No module named/.test(String(r.err) + String(r.out))) {
-    pushLog('🐍 pypdf 未装，尝试 pip 自救…');
+    pushLog('🐍 PDF 解析库未装，尝试 pip 自救（pymupdf→pypdf）…');
     // Ubuntu 24.04 runner 是 externally-managed（PEP 668）：普通 pip install 会被拒。
     // 依次尝试 --break-system-packages（系统级）→ --user（用户级），任一成功即可。
-    const pip1 = await runShell('python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pypdf', 120000);
-    if (!pip1.ok) await runShell('python3 -m pip install --quiet --disable-pip-version-check --user pypdf', 120000);
+    for (const pkg of ['pymupdf', 'pypdf']) {
+      const pip1 = await runShell('python3 -m pip install --quiet --disable-pip-version-check --break-system-packages ' + pkg, 180000);
+      if (!pip1.ok) await runShell('python3 -m pip install --quiet --disable-pip-version-check --user ' + pkg, 180000);
+    }
     r = await runShell('python3 ' + JSON.stringify(f) + ' ' + JSON.stringify(pdfPath), 30000, 8 * 1024 * 1024);
-    if (!r.ok) pushLog('⚠️ 书签读取仍失败（pypdf 自救未成功），本本将退回页脚/目录/宫格路线', 'warn');
+    if (!r.ok) pushLog('⚠️ 书签读取仍失败（pip 自救未成功），本本将退回页脚/目录/宫格路线', 'warn');
   }
   try { fsT.unlinkSync(f); } catch (e) {}
   if (!r.ok) return null;
