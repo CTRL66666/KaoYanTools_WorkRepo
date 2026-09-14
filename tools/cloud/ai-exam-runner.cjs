@@ -133,7 +133,8 @@ async function readSourceBuffer(files, tag) {
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
 // v32 = 宫格定界逐页分类改造（实测 25 页 5 套只认 1 套：12 页开放列举→6 页逐页二分类）+ 纯扫描多套卷视觉预算动态提额（页×2+30）。
-const RUNNER_VER = 'v32';
+// v33 = 标题带转录判号定界（逐页裁顶栏转录标题+本地确定性判号，两路并集）+ start 宽容布尔（"true"/1/"是" 不再被 ===true 丢弃）。
+const RUNNER_VER = 'v33';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1465,6 +1466,53 @@ async function extractBookTocVision(deps) {
   return tocEntriesToChapters(entries, tocLastPage, pages);
 }
 
+/* 【v33 标题带定界】纯扫描套卷书的最可靠结构信号：每套首页顶部都有大字标题
+ * （「…模拟试卷二」「第3套」）。与其让 VLM 在整页缩略图里「找出所有套首」（弱模型
+ * 系统性少报），不如只裁【页顶横条】让它【逐页转录标题】（转录远比判断容易、小图远比整页清晰），
+ * 再由本地规则判号：标题含「试卷/卷/第N套」编号，且编号与上一个套首不同（或距上一个 ≥4 页）→ 套首。
+ * 判定完全确定性，模型只负责读字。返回 [{page,title}]。 */
+const CN_NUM = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10, 十一: 11, 十二: 12, 十三: 13, 十四: 14, 十五: 15, 十六: 16, 十七: 17, 十八: 18, 十九: 19, 二十: 20, 二十一: 21, 二十二: 22, 二十三: 23, 二十四: 24, 二十五: 25 };
+function parseSetNo(t) {
+  if (!t) return null;
+  const s = String(t);
+  let m = /(?:模拟试卷|试卷|卷)\s*([一二三四五六七八九十]{1,3}|\d{1,2})/.exec(s);
+  if (!m) m = /第\s*([一二三四五六七八九十]{1,3}|\d{1,2})\s*(?:套|卷|组)/.exec(s);
+  if (!m) return null;
+  const g = m[1];
+  return /^\d+$/.test(g) ? parseInt(g, 10) : (CN_NUM[g] != null ? CN_NUM[g] : null);
+}
+/* 宽容布尔：不同模型对 true 的表达五花八门（"true"/1/"是"/"yes"），严格 ===true 会全丢。 */
+function isStartVal(v) { return v === true || v === 1 || v === '1' || v === 'true' || v === '是' || v === 'yes'; }
+async function detectSetsByTitleBand(deps) {
+  const { pages, renderPageImgs, aiJson, budgetOk, pageW, pageH } = deps;
+  if (!pageW || !pageH) return [];
+  const DPI = 150;
+  const bandW = Math.round(pageW * DPI / 72);
+  const bandH = Math.round(pageH * 0.17 * DPI / 72);   // 页顶 17%：套名标题行必在其中
+  const titles = {};
+  for (let i = 1; i <= pages; i += 8) {
+    const group = []; for (let p = i; p < Math.min(i + 8, pages + 1); p++) group.push(p);
+    if (budgetOk && !budgetOk('标题带定界 P' + group[0] + '-' + group[group.length - 1])) break;
+    const imgs = await renderPageImgs(group, { dpi: DPI, crop: { x: 0, y: 0, w: bandW, h: bandH } });
+    if (imgs.length !== group.length) continue;   // 渲染缺页→整组跳过：错位转录比不转录更糟
+    const r = await aiJson(
+      [{ role: 'system', content: '你是标题转录机。给出的是同一份 PDF 连续若干页各自的【顶部横条截图】（按页码顺序）。逐页转录横条上的标题大字行原文；没有明显标题就写空串。只转录，不判断、不翻译、不改写。'
+        + '只输出 JSON：{"pages":[{"p":页码,"title":"顶部标题原文(≤40字)"}]}，每页一条、按给出顺序、一页不落。' },
+       { role: 'user', content: [{ type: 'text', text: '页码依次为：' + group.join('、') + '（共 ' + imgs.length + ' 张横条图，与页码一一对应）。逐页转录。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+      { think: false, temperature: 0, maxTokens: 1200 });
+    const rows = Array.isArray(r && r.pages) ? r.pages : [];
+    rows.forEach(function (s) { const sp = parseInt(s && s.p, 10); if (sp >= group[0] && sp <= group[group.length - 1]) titles[sp] = String((s && s.title) || '').trim().slice(0, 40); });
+  }
+  const starts = [];
+  let lastNo = null, lastPage = 0;
+  for (let p = 1; p <= pages; p++) {
+    const t = titles[p] || '';
+    const no = parseSetNo(t);
+    if (no == null) continue;
+    if (lastNo == null || no !== lastNo || p - lastPage >= 4) { starts.push({ page: p, title: t }); lastNo = no; lastPage = p; }
+  }
+  return starts;
+}
 /* 【v22 R4 缩略图定界】最后一层兜底：纯扫描 + 无书签 + 无页脚锚点 + 无目录页的书
  * （实测：26合工大超越 1-25，25 页全扫描 0 书签）——旧版到 R5 直接抛「可读文字页过少」死路。
  * 方法论 R4：低分辨率整页图喂 VLM 找「新套卷起始页」（每套首页顶部大字套名、题号从 1 重启）。
@@ -1474,7 +1522,7 @@ async function extractBookTocVision(deps) {
  * 返回 {chapters:[{title,from,to,group}]}（≥1 套）或 null。 */
 async function detectSetsByGrid(deps) {
   const { pages, renderPageImgs, aiJson, budgetOk } = deps;
-  const found = [];
+  const found = (deps.extraStarts || []).slice();   // 【v33】标题带定界的确定性结果并入候选（S2 统一高清确认）
   for (let i = 1; i <= pages; i += 6) {
     const group = []; for (let p = i; p < Math.min(i + 6, pages + 1); p++) group.push(p);
     if (budgetOk && !budgetOk('宫格定界 P' + group[0] + '-' + group[group.length - 1])) break;
@@ -1491,7 +1539,7 @@ async function detectSetsByGrid(deps) {
     const rows = Array.isArray(r && r.pages) ? r.pages : [];
     rows.forEach(function (s) {
       const sp = parseInt(s && s.p, 10);
-      if (s && s.start === true && sp >= group[0] && sp <= group[group.length - 1]) found.push({ page: sp, title: String((s && s.title) || '').trim().slice(0, 40) });
+      if (s && isStartVal(s.start) && sp >= group[0] && sp <= group[group.length - 1]) found.push({ page: sp, title: String((s && s.title) || '').trim().slice(0, 40) });
     });
   }
   // 【S2 边界精化】候选套首逐页高清确认（缩略图实测会把续页 (15)(16) 误判成套首）；
@@ -1874,7 +1922,24 @@ async function runImport(gist, job, prefs) {
         const out = [];
         const two = !opts && !!(RENDER_2UP && RENDER_2UP.pageW > RENDER_2UP.pageH * 1.1);   // opts.forceWhole 时不裁半（宫格定界看整页版面）
         const DPI = (opts && opts.dpi) || (two ? 200 : 150);
+        // 【v33 标题带】opts.crop={x,y,w,h}（像素，按 DPI 计）：只渲染页顶标题带——
+        // 小图转录标题远比整页「找所有套首」可靠（弱模型/慢供应商下的确定性定界路线）。
+        const crBand = opts && opts.crop;
         for (const p of pList) {
+          if (crBand) {
+            const bb = pathT.join(wd, 'pg' + p + 'b');
+            const cmdB = 'pdftoppm -f ' + p + ' -l ' + p + ' -png -r ' + DPI +
+              ' -x ' + crBand.x + ' -y ' + crBand.y + ' -W ' + crBand.w + ' -H ' + crBand.h + ' ' +
+              JSON.stringify(pdfPath) + ' ' + JSON.stringify(bb);
+            const rb = await runShell(cmdB, 90000);
+            if (!rb.ok) { pushLog('⚠️ 第 ' + p + ' 页标题带渲染失败：' + String(rb.err).slice(0, 100), 'warn'); continue; }
+            for (const f of fsT.readdirSync(wd).filter(x => x.indexOf('pg' + p + 'b-') === 0 && /\.png$/.test(x))) {
+              const data = fsT.readFileSync(pathT.join(wd, f));
+              if (data.length > 2.6 * 1024 * 1024) continue;
+              out.push('data:image/png;base64,' + data.toString('base64'));
+            }
+            continue;
+          }
           if (two) {
             for (const half of ['l', 'r']) {
               const cr = halfCropArgs(RENDER_2UP.pageW, RENDER_2UP.pageH, DPI, half === 'l' ? 'left' : 'right');
@@ -2000,12 +2065,18 @@ async function runImport(gist, job, prefs) {
             } catch (e) { pushLog('⚠️ 大类归类失败（' + String(e.message || e).slice(0, 80) + '），全部归入「全册」', 'warn'); }
           }
         }
-        // R4b 宫格定界（v22 纯扫描兜底；v32 逐页分类）：书签/页脚/目录全空但整本以扫描页为主时，
-        //   每 6 页一组低分辨率整页图让 VLM 逐页判定「是否新套卷起始页」（方法论 R4）。
+        // R4b 纯扫描定界（v22 兜底；v32 逐页分类；v33 标题带转录判号优先）：书签/页脚/目录全空
+        //   但整本以扫描页为主时，两路并集找套首——①逐页裁顶栏转录标题+本地判号（确定性）；
+        //   ②每 6 页一组整页逐页二分类（补标题不带编号的书）；候选统一走 S2 高清确认。
         if (!chapters && imgPages.length * 2 >= pages) {
           try {
-            pushLog('🧩 书签/页脚/目录均无结构 → 缩略图宫格定界（纯扫描兜底）…');
-            const g = await detectSetsByGrid({ pages: pages, renderPageImgs: renderPageImgs, aiJson: aiJson, budgetOk: budgetOk });
+            pushLog('🧩 书签/页脚/目录均无结构 → 纯扫描定界（标题带转录判号 + 整页逐页分类 + 高清确认）…');
+            let bandStarts = [];
+            try {
+              bandStarts = await detectSetsByTitleBand({ pages: pages, renderPageImgs: renderPageImgs, aiJson: aiJson, budgetOk: budgetOk, pageW: pageW, pageH: pageH });
+              pushLog('🧩 标题带定界：' + bandStarts.length + ' 套' + (bandStarts.length ? '（P' + bandStarts.map(c => c.page).join('、') + '）' : ''));
+            } catch (e) { pushLog('⚠️ 标题带定界失败（' + String((e && e.message) || e).slice(0, 100) + '），仅走整页分类', 'warn'); }
+            const g = await detectSetsByGrid({ pages: pages, renderPageImgs: renderPageImgs, aiJson: aiJson, budgetOk: budgetOk, extraStarts: bandStarts });
             if (g && g.chapters.length) {
               chapters = g.chapters;
               structSrc = '🧩 宫格定界（VLM 找套首页）';
