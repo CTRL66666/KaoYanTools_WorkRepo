@@ -132,7 +132,8 @@ async function readSourceBuffer(files, tag) {
 // 执行器版本（单一事实来源）：本地 cloudjob.ts 用正则从本文件源码提取（本地资产 vs 仓库远端），
 // 向导第②步显示「云端 v? vs 本地 v?」。改版本只改这一处，所有 status.json 回写自动跟随。
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
-const RUNNER_VER = 'v31';
+// v32 = 宫格定界逐页分类改造（实测 25 页 5 套只认 1 套：12 页开放列举→6 页逐页二分类）+ 纯扫描多套卷视觉预算动态提额（页×2+30）。
+const RUNNER_VER = 'v32';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1466,28 +1467,31 @@ async function extractBookTocVision(deps) {
 
 /* 【v22 R4 缩略图定界】最后一层兜底：纯扫描 + 无书签 + 无页脚锚点 + 无目录页的书
  * （实测：26合工大超越 1-25，25 页全扫描 0 书签）——旧版到 R5 直接抛「可读文字页过少」死路。
- * 方法论 R4：每 12 页一组低分辨率整页图喂 VLM，找「新套卷起始页」（每套首页顶部大字套名、题号从 1 重启）。
+ * 方法论 R4：低分辨率整页图喂 VLM 找「新套卷起始页」（每套首页顶部大字套名、题号从 1 重启）。
+ * 【v32 逐页分类改造（实测教训：25 页 5 套只认出 1 套）】旧版每 12 页一组「开放列举套首页」
+ *   ——VLM 对开放式"找出所有"系统性少报，且 12 图大载荷在慢供应商动辄 120-200s 超时。
+ *   改为每 6 页一组、对【每一页】输出 {p,start,title} 二分类（逐页判定召回远高于开放列举），跨组合并。
  * 返回 {chapters:[{title,from,to,group}]}（≥1 套）或 null。 */
 async function detectSetsByGrid(deps) {
   const { pages, renderPageImgs, aiJson, budgetOk } = deps;
   const found = [];
-  for (let i = 1; i <= pages; i += 12) {
-    const group = []; for (let p = i; p < Math.min(i + 12, pages + 1); p++) group.push(p);
+  for (let i = 1; i <= pages; i += 6) {
+    const group = []; for (let p = i; p < Math.min(i + 6, pages + 1); p++) group.push(p);
     if (budgetOk && !budgetOk('宫格定界 P' + group[0] + '-' + group[group.length - 1])) break;
     const imgs = await renderPageImgs(group, { dpi: 96, forceWhole: true });
     if (!imgs.length) continue;
     const r = await aiJson(
-      [{ role: 'system', content: '你是试卷合订本结构分析引擎。给你的图片按顺序是一本书的连续页面（缩略图，只看版面结构不必读题）。'
-        + '这是「多套模拟卷合订」：每套卷第一页同时满足两个特征——①顶部有大字试卷标题（如「XX模拟试卷N」「XX六套卷第N套」）；②该页从题号 (1)/1. 重新开始。'
-        + '若某页题号从上页延续（如从 (15)、三、解答题 17 开始），它是续页，不是套首。'
-        + '找出每一套卷的起始页。只输出 JSON：{"sets":[{"startPage":物理页码,"title":"套卷标题原文(≤40字)"}]}。'
-        + '封面/目录/空白页不算套；整本就一套时输出 1 条；不确定就别列。' },
-       { role: 'user', content: [{ type: 'text', text: '这些是全书第 ' + group[0] + '—' + group[group.length - 1] + ' 页（按图片顺序）。请找出新套卷的起始页。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-      { think: false, temperature: 0.1, maxTokens: 2000 });
-    const sets = Array.isArray(r && r.sets) ? r.sets : [];
-    sets.forEach(function (s) {
-      const sp = parseInt(s && s.startPage, 10);
-      if (sp >= group[0] && sp <= group[group.length - 1]) found.push({ page: sp, title: String((s && s.title) || '').trim().slice(0, 40) });
+      [{ role: 'system', content: '你是试卷合订本结构分析引擎。给你的图片按顺序是一本书连续的若干页缩略图（只看版面结构，不必读题）。'
+        + '「多套模拟卷合订」的套卷首页同时满足：①顶部有大字试卷标题（如「XX模拟试卷N」「XX六套卷第N套」）；②该页从题号 (1)/1. 重新开始。'
+        + '若某页题号从上页延续（如从 (15)、三、解答题 17 开始）则是续页。封面/目录/空白页不是套首。'
+        + '【逐页判定，一页不落】对输入的每一页都按给出顺序输出一条（p 为物理页码）：'
+        + '只输出 JSON：{"pages":[{"p":页码,"start":true或false,"title":"start=true 时抄顶部标题(≤40字)，否则空串"}]}。' },
+       { role: 'user', content: [{ type: 'text', text: '这些是全书第 ' + group[0] + '—' + group[group.length - 1] + ' 页（按图片顺序，共 ' + imgs.length + ' 张）。逐页判定是否套卷首页。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+      { think: false, temperature: 0.1, maxTokens: 1600 });
+    const rows = Array.isArray(r && r.pages) ? r.pages : [];
+    rows.forEach(function (s) {
+      const sp = parseInt(s && s.p, 10);
+      if (s && s.start === true && sp >= group[0] && sp <= group[group.length - 1]) found.push({ page: sp, title: String((s && s.title) || '').trim().slice(0, 40) });
     });
   }
   // 【S2 边界精化】候选套首逐页高清确认（缩略图实测会把续页 (15)(16) 误判成套首）；
@@ -1925,8 +1929,9 @@ async function runImport(gist, job, prefs) {
         const subject = SUBJ_NAME[subj] || subj;
         const imgSet = {}; imgPages.forEach(p => { imgSet[p] = 1; });
         // 【v21 预算硬顶】铁律⑤：视觉调用 ≤ 页数×1.2+20（声明提前：宫格定界/预检/提取/补提共用闸门）
+        // 【v32】let：宫格定界的纯扫描多套卷密度约 2 次/页，定界成功后动态提额（见 R4b）。
         let BOOK_VLM = 0;
-        const BOOK_BUDGET = Math.floor(pages * 1.2 + 20);
+        let BOOK_BUDGET = Math.floor(pages * 1.2 + 20);
         function budgetOk(tag) {
           if (BOOK_VLM >= BOOK_BUDGET) { pushLog('⛔ 视觉调用预算到顶（' + BOOK_BUDGET + '），跳过：' + tag, 'warn'); return false; }
           BOOK_VLM++; return true;
@@ -1995,8 +2000,8 @@ async function runImport(gist, job, prefs) {
             } catch (e) { pushLog('⚠️ 大类归类失败（' + String(e.message || e).slice(0, 80) + '），全部归入「全册」', 'warn'); }
           }
         }
-        // R4b 宫格定界（v22 纯扫描兜底）：书签/页脚/目录全空但整本以扫描页为主时，
-        //   每 12 页一组低分辨率整页图让 VLM 找「新套卷起始页」（方法论 R4）。
+        // R4b 宫格定界（v22 纯扫描兜底；v32 逐页分类）：书签/页脚/目录全空但整本以扫描页为主时，
+        //   每 6 页一组低分辨率整页图让 VLM 逐页判定「是否新套卷起始页」（方法论 R4）。
         if (!chapters && imgPages.length * 2 >= pages) {
           try {
             pushLog('🧩 书签/页脚/目录均无结构 → 缩略图宫格定界（纯扫描兜底）…');
@@ -2004,7 +2009,10 @@ async function runImport(gist, job, prefs) {
             if (g && g.chapters.length) {
               chapters = g.chapters;
               structSrc = '🧩 宫格定界（VLM 找套首页）';
-              pushLog('🧩 宫格定界：' + chapters.length + ' 套（起始页 ' + chapters.slice(0, 12).map(c => c.from).join('、') + (chapters.length > 12 ? '…' : '') + '）');
+              // 【v32 动态提额】纯扫描多套卷每页几乎都是题图（密度约 2 次/页），固定 1.2/页
+              // 会在定界正确后把后续章节提取饿死（实测 31/50 才提出 1 套）→ 提到 2/页+30。
+              BOOK_BUDGET = Math.max(BOOK_BUDGET, Math.floor(pages * 2 + 30));
+              pushLog('🧩 宫格定界：' + chapters.length + ' 套（起始页 ' + chapters.slice(0, 12).map(c => c.from).join('、') + (chapters.length > 12 ? '…' : '') + '）· 纯扫描预算提至 ' + BOOK_BUDGET);
             }
           } catch (e) { pushLog('⚠️ 宫格定界失败（' + String((e && e.message) || e).slice(0, 100) + '）', 'warn'); }
         }
