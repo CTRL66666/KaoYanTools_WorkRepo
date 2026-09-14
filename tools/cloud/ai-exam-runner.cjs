@@ -134,7 +134,10 @@ async function readSourceBuffer(files, tag) {
 // 版本规则：runner 行为变更才 +1（v15 = 资料库 book 通道；v16 = 429 共享闸门不弃题 + score=0 自动均摊修复；v17 = book 分发致命修复 + 数学乱码转视觉）。
 // v32 = 宫格定界逐页分类改造（实测 25 页 5 套只认 1 套：12 页开放列举→6 页逐页二分类）+ 纯扫描多套卷视觉预算动态提额（页×2+30）。
 // v33 = 标题带转录判号定界（逐页裁顶栏转录标题+本地确定性判号，两路并集）+ start 宽容布尔（"true"/1/"是" 不再被 ===true 丢弃）。
-const RUNNER_VER = 'v33';
+// v34 = 定界链韧性（v33 回归：一次供应商 500 让整条链 throw → 连 v32 的 1 套都不剩）：
+//       标题带/宫格逐组 try-catch（一组失败不拖垮全局）+ 裁图缺页退回整页 + S2 确认失败保留候选；
+//       四条结构路全空时不再抛错，整本按单章兜底提取（纯扫描书最坏也出内容，永不再归零）；转录样本诊断日志。
+const RUNNER_VER = 'v34';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1493,16 +1496,25 @@ async function detectSetsByTitleBand(deps) {
   for (let i = 1; i <= pages; i += 8) {
     const group = []; for (let p = i; p < Math.min(i + 8, pages + 1); p++) group.push(p);
     if (budgetOk && !budgetOk('标题带定界 P' + group[0] + '-' + group[group.length - 1])) break;
-    const imgs = await renderPageImgs(group, { dpi: DPI, crop: { x: 0, y: 0, w: bandW, h: bandH } });
-    if (imgs.length !== group.length) continue;   // 渲染缺页→整组跳过：错位转录比不转录更糟
-    const r = await aiJson(
-      [{ role: 'system', content: '你是标题转录机。给出的是同一份 PDF 连续若干页各自的【顶部横条截图】（按页码顺序）。逐页转录横条上的标题大字行原文；没有明显标题就写空串。只转录，不判断、不翻译、不改写。'
-        + '只输出 JSON：{"pages":[{"p":页码,"title":"顶部标题原文(≤40字)"}]}，每页一条、按给出顺序、一页不落。' },
-       { role: 'user', content: [{ type: 'text', text: '页码依次为：' + group.join('、') + '（共 ' + imgs.length + ' 张横条图，与页码一一对应）。逐页转录。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-      { think: false, temperature: 0, maxTokens: 1200 });
-    const rows = Array.isArray(r && r.pages) ? r.pages : [];
-    rows.forEach(function (s) { const sp = parseInt(s && s.p, 10); if (sp >= group[0] && sp <= group[group.length - 1]) titles[sp] = String((s && s.title) || '').trim().slice(0, 40); });
+    try {
+      let imgs = await renderPageImgs(group, { dpi: DPI, crop: { x: 0, y: 0, w: bandW, h: bandH } });
+      // 裁图缺页/尺寸异常 → 整组退回低清整页（转录顶部标题仍可行），绝不因一组拖垮全局
+      if (imgs.length !== group.length) {
+        pushLog('⚠️ 标题带 P' + group[0] + ' 起渲染 ' + imgs.length + '/' + group.length + '，退回整页低清转录');
+        imgs = await renderPageImgs(group, { dpi: 110, forceWhole: true });
+      }
+      if (imgs.length !== group.length) continue;   // 仍不齐则跳过本组（错位转录比不转录更糟）
+      const r = await aiJson(
+        [{ role: 'system', content: '你是标题转录机。给出的是同一份 PDF 连续若干页各自的【顶部横条截图】（按页码顺序）。逐页转录横条上的标题大字行原文；没有明显标题就写空串。只转录，不判断、不翻译、不改写。'
+          + '只输出 JSON：{"pages":[{"p":页码,"title":"顶部标题原文(≤40字)"}]}，每页一条、按给出顺序、一页不落。' },
+         { role: 'user', content: [{ type: 'text', text: '页码依次为：' + group.join('、') + '（共 ' + imgs.length + ' 张横条图，与页码一一对应）。逐页转录。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+        { think: false, temperature: 0, maxTokens: 1200 });
+      const rows = Array.isArray(r && r.pages) ? r.pages : [];
+      rows.forEach(function (s) { const sp = parseInt(s && s.p, 10); if (sp >= group[0] && sp <= group[group.length - 1]) titles[sp] = String((s && s.title) || '').trim().slice(0, 40); });
+    } catch (e) { pushLog('⚠️ 标题带定界 P' + group[0] + ' 组失败（' + String((e && e.message) || e).slice(0, 80) + '），继续其余组', 'warn'); }
   }
+  const dbg = Object.keys(titles).slice(0, 3).map(k => 'P' + k + ':' + (titles[k] || '∅'));
+  pushLog('🧩 标题带转录样本：' + (dbg.join(' / ') || '无'));
   const starts = [];
   let lastNo = null, lastPage = 0;
   for (let p = 1; p <= pages; p++) {
@@ -1526,22 +1538,25 @@ async function detectSetsByGrid(deps) {
   for (let i = 1; i <= pages; i += 6) {
     const group = []; for (let p = i; p < Math.min(i + 6, pages + 1); p++) group.push(p);
     if (budgetOk && !budgetOk('宫格定界 P' + group[0] + '-' + group[group.length - 1])) break;
-    const imgs = await renderPageImgs(group, { dpi: 96, forceWhole: true });
-    if (!imgs.length) continue;
-    const r = await aiJson(
-      [{ role: 'system', content: '你是试卷合订本结构分析引擎。给你的图片按顺序是一本书连续的若干页缩略图（只看版面结构，不必读题）。'
-        + '「多套模拟卷合订」的套卷首页同时满足：①顶部有大字试卷标题（如「XX模拟试卷N」「XX六套卷第N套」）；②该页从题号 (1)/1. 重新开始。'
-        + '若某页题号从上页延续（如从 (15)、三、解答题 17 开始）则是续页。封面/目录/空白页不是套首。'
-        + '【逐页判定，一页不落】对输入的每一页都按给出顺序输出一条（p 为物理页码）：'
-        + '只输出 JSON：{"pages":[{"p":页码,"start":true或false,"title":"start=true 时抄顶部标题(≤40字)，否则空串"}]}。' },
-       { role: 'user', content: [{ type: 'text', text: '这些是全书第 ' + group[0] + '—' + group[group.length - 1] + ' 页（按图片顺序，共 ' + imgs.length + ' 张）。逐页判定是否套卷首页。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-      { think: false, temperature: 0.1, maxTokens: 1600 });
-    const rows = Array.isArray(r && r.pages) ? r.pages : [];
-    rows.forEach(function (s) {
-      const sp = parseInt(s && s.p, 10);
-      if (s && isStartVal(s.start) && sp >= group[0] && sp <= group[group.length - 1]) found.push({ page: sp, title: String((s && s.title) || '').trim().slice(0, 40) });
-    });
+    try {
+      const imgs = await renderPageImgs(group, { dpi: 96, forceWhole: true });
+      if (!imgs.length) continue;
+      const r = await aiJson(
+        [{ role: 'system', content: '你是试卷合订本结构分析引擎。给你的图片按顺序是一本书连续的若干页缩略图（只看版面结构，不必读题）。'
+          + '「多套模拟卷合订」的套卷首页同时满足：①顶部有大字试卷标题（如「XX模拟试卷N」「XX六套卷第N套」）；②该页从题号 (1)/1. 重新开始。'
+          + '若某页题号从上页延续（如从 (15)、三、解答题 17 开始）则是续页。封面/目录/空白页不是套首。'
+          + '【逐页判定，一页不落】对输入的每一页都按给出顺序输出一条（p 为物理页码）：'
+          + '只输出 JSON：{"pages":[{"p":页码,"start":true或false,"title":"start=true 时抄顶部标题(≤40字)，否则空串"}]}。' },
+         { role: 'user', content: [{ type: 'text', text: '这些是全书第 ' + group[0] + '—' + group[group.length - 1] + ' 页（按图片顺序，共 ' + imgs.length + ' 张）。逐页判定是否套卷首页。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+        { think: false, temperature: 0.1, maxTokens: 1600 });
+      const rows = Array.isArray(r && r.pages) ? r.pages : [];
+      rows.forEach(function (s) {
+        const sp = parseInt(s && s.p, 10);
+        if (s && isStartVal(s.start) && sp >= group[0] && sp <= group[group.length - 1]) found.push({ page: sp, title: String((s && s.title) || '').trim().slice(0, 40) });
+      });
+    } catch (e) { pushLog('⚠️ 宫格定界 P' + group[0] + ' 组失败（' + String((e && e.message) || e).slice(0, 80) + '），继续其余组', 'warn'); }
   }
+  pushLog('🧩 定界候选：' + found.length + ' 个套首（含标题带并集）');
   // 【S2 边界精化】候选套首逐页高清确认（缩略图实测会把续页 (15)(16) 误判成套首）；
   //   首页 1 也强制确认（模型常因「书从中途开始」不自信而漏报第一套）。
   const cands = {};
@@ -1553,12 +1568,16 @@ async function detectSetsByGrid(deps) {
     if (budgetOk && !budgetOk('套首确认 P' + cp)) break;
     const one = await renderPageImgs([cp], { dpi: 200, forceWhole: true });
     if (!one.length) { confirmed.push({ page: cp, title: cands[cp] || '' }); continue; }
-    const v = await aiJson(
-      [{ role: 'system', content: '给你一本书的一页（高清）。判断它是否是一套试卷的第一页：①顶部有大字试卷标题；②本页从题号 (1)/1. 重新开始（若从 (15) 等延续题号开始则是续页）。'
-        + '只输出 JSON：{"isStart":true/false,"title":"若 isStart 给出卷标题原文(≤40字)，否则空串"}。' },
-       { role: 'user', content: [{ type: 'text', text: '请判断这一页是否新套卷首页。' }].concat(one.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-      { think: false, temperature: 0, maxTokens: 400 });
-    if (v && v.isStart) confirmed.push({ page: cp, title: String(v.title || cands[cp] || '').trim().slice(0, 40) });
+    try {
+      const v = await aiJson(
+        [{ role: 'system', content: '给你一本书的一页（高清）。判断它是否是一套试卷的第一页：①顶部有大字试卷标题；②本页从题号 (1)/1. 重新开始（若从 (15) 等延续题号开始则是续页）。'
+          + '只输出 JSON：{"isStart":true/false,"title":"若 isStart 给出卷标题原文(≤40字)，否则空串"}。' },
+         { role: 'user', content: [{ type: 'text', text: '请判断这一页是否新套卷首页。' }].concat(one.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
+        { think: false, temperature: 0, maxTokens: 400 });
+      // 确认失败（网络抖动/解析失败）时保留候选：宁可多一套也不因供应商 500 归零（v34）
+      if (!v || typeof v.isStart === 'undefined') { confirmed.push({ page: cp, title: cands[cp] || '' }); continue; }
+      if (isStartVal(v.isStart)) confirmed.push({ page: cp, title: String(v.title || cands[cp] || '').trim().slice(0, 40) });
+    } catch (e) { pushLog('⚠️ 套首确认 P' + cp + ' 失败（' + String((e && e.message) || e).slice(0, 60) + '），保留候选', 'warn'); confirmed.push({ page: cp, title: cands[cp] || '' }); }
   }
   if (!confirmed.length) return null;
   confirmed.sort(function (a, b) { return a.page - b.page; });
@@ -2095,7 +2114,14 @@ async function runImport(gist, job, prefs) {
             const t = String(pgTxt[p] || '').replace(/\s+/g, ' ').trim();
             if (t.length >= 40) digest.push('P' + p + ': ' + t.slice(0, 110));
           }
-          if (digest.length < 3) throw new Error('无法建立结构：书签/页脚/目录/宫格定界四条路都没拿到结构，且可读文字页过少（' + digest.length + ' 页）——若是纯扫描版合订书，请确认已安装 v22+ 执行器（宫格定界）后重发；仍失败可按套拍照分批导入');
+          if (digest.length < 3) {
+            // 【v34 永不再归零】纯扫描书四条结构路全空时，旧版直接 throw（用户视角=任务失败、
+            // 连一套都提不出，比 v32 还差）。兜底：整本按「一套」处理（单章覆盖全页），
+            // 提取窗口逐页跑，至少把能认的题都收进来；日志明说降级原因，用户可再按套拍照导入精修。
+            pushLog('⚠️ 书签/页脚/目录/定界均无果 → 整本按一套处理（单章 P1-' + pages + '），逐页视觉提取兜底；如需按套精修可拆分后分批导入', 'warn');
+            chapters = [{ title: (prefs.bookName || '扫描合订卷').slice(0, 40), from: 1, to: pages, group: '' }];
+            structSrc = '⚠️ 整本兜底（无结构信号）';
+          } else {
           const outline = await aiJson(
             [{ role: 'system', content: '你是教材结构分析专家。根据一份资料的逐页摘要（P页码: 内容首行）划分章节结构。只输出 JSON：{"chapters":[{"title":"章节名(≤40字)","from":起始页,"to":结束页,"group":"所属大类(≤12字，没有则留空)"}]}。要求：2-150 个章节；页码范围连续、不重叠、覆盖全部有内容的页。粒度=书的一级目录（章/讲），不要拆到小节。【特例】若这份资料是「多套试卷/习题的合集」（每套 2-6 页、标题形如 XX五套卷第N套 / 模拟卷N），则每一套卷单独成章（title 用套卷全名，如 "2024余炳森五套卷第3套"），并按难度层级或系列给出 group（如 入门/进阶/难；同书同层级时 group 可留空）。' },
              { role: 'user', content: '【逐页摘要】（共 ' + pages + ' 页）\n' + digest.join('\n') + '\n\n请划分章节。' }],
@@ -2104,6 +2130,7 @@ async function runImport(gist, job, prefs) {
             .map(c => ({ title: String((c && c.title) || '未命名章节').slice(0, 40), from: Math.max(1, Number(c && c.from) || 1), to: Math.min(pages, Number(c && c.to) || 1), group: String((c && c.group) || '').trim().slice(0, 12) }))
             .filter(c => c.to >= c.from).slice(0, 150);
           if (!chapters.length) throw new Error('AI 未划分出有效章节');
+          }
         }
         pushLog('🗂 章节划分（' + structSrc + '）：' + chapters.length + ' 章 · ' + (chapters.some(c => c.group) ? chapters.length + ' 个小类 / ' + deriveBookGroups(chapters).length + ' 个大类' : '单层级'));
 
