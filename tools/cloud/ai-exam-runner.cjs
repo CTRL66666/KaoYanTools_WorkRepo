@@ -137,7 +137,12 @@ async function readSourceBuffer(files, tag) {
 // v34 = 定界链韧性（v33 回归：一次供应商 500 让整条链 throw → 连 v32 的 1 套都不剩）：
 //       标题带/宫格逐组 try-catch（一组失败不拖垮全局）+ 裁图缺页退回整页 + S2 确认失败保留候选；
 //       四条结构路全空时不再抛错，整本按单章兜底提取（纯扫描书最坏也出内容，永不再归零）；转录样本诊断日志。
-const RUNNER_VER = 'v34';
+// v35 = 标题带改【逐页单图转录】（v34 实测 8 张一批会页码错位/幻觉：P1 有标题回 ∅、P2 回别页标题）
+//       + 标题带找到 ≥2 套首即跳过整页分类（省请求省墙钟）。
+// v36 = 选项铁律（用户实测：库里的选择题只存题干、选项全丢，AI 只好说"给结论+理由不用圈选项"）：
+//       书提取提示词强制选择题输出全部 4 个选项；保存侧选项截断 120→240 字；收尾选项审计
+//       （答案=单字母但无 options 的题计数告警并给重发/补录建议）。
+const RUNNER_VER = 'v36';
 
 if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
@@ -1297,6 +1302,10 @@ function normalizeImported(q, g) {
 const BOOK_Q_COMPLETE_RULE = '【完整性铁律——最重要】必须输出本章全部题目，一题不落：'
   + '每题的 num 填原文题号（数字），输出前自查题号是否从最小号连续覆盖到最大号；'
   + '题干再长、解析再繁也不许省略或概括——宁可 solution 写简，不可丢题。原文没有的题号不许编造。'
+  + '【选项铁律】选择题必须输出【全部选项】options（每题 4 项，每项以 "A. "…开头、含该项完整文本），'
+  + '一项不许少、不许只给首项、不许概括写成"见原文"；选项里的公式照常用 $…$ LaTeX 还原。'
+  + '填空题/解答题没有选项才省略 options。缺选项的选择题会被系统判为提取失败——'
+  + '（用户实测：库里的选择题只存了题干、选项全丢，复习时无法作答）。'
   + '【LaTeX 书写】公式命令与其花括号/参数连续书写，命令之间禁止插入多余空格'
   + '（写 $\\dfrac{1}{x}$、$\\lim\\limits_{x\\to+\\infty}$、$\\begin{cases}$，不要写成 \\dfrac {1} {x} 或 \\begin {cases}）；'
   + '反斜杠命令必须完整（\\begin 不能漏成 \\egin），下标上标紧贴符号。';
@@ -1486,6 +1495,10 @@ function parseSetNo(t) {
 }
 /* 宽容布尔：不同模型对 true 的表达五花八门（"true"/1/"是"/"yes"），严格 ===true 会全丢。 */
 function isStartVal(v) { return v === true || v === 1 || v === '1' || v === 'true' || v === '是' || v === 'yes'; }
+/* 【v35 逐页单图转录】v34 实测：8 张一组的批量转录会【错位/幻觉】——P1 明明有标题却回 ∅、
+ * P2 回了别页的「试卷二」。弱模型一次看多图时页码↔图对应关系不可靠。改为每页【单独一张
+ * 顶栏小图】一问一答：单图单问是 VLM 最稳的形态（预检里模型读单页标题一直正确）。
+ * 成本：每页 1 次小请求（预算已按纯扫描提额），换来的是确定性结构。 */
 async function detectSetsByTitleBand(deps) {
   const { pages, renderPageImgs, aiJson, budgetOk, pageW, pageH } = deps;
   if (!pageW || !pageH) return [];
@@ -1493,27 +1506,21 @@ async function detectSetsByTitleBand(deps) {
   const bandW = Math.round(pageW * DPI / 72);
   const bandH = Math.round(pageH * 0.17 * DPI / 72);   // 页顶 17%：套名标题行必在其中
   const titles = {};
-  for (let i = 1; i <= pages; i += 8) {
-    const group = []; for (let p = i; p < Math.min(i + 8, pages + 1); p++) group.push(p);
-    if (budgetOk && !budgetOk('标题带定界 P' + group[0] + '-' + group[group.length - 1])) break;
+  for (let p = 1; p <= pages; p++) {
+    if (budgetOk && !budgetOk('标题带转录 P' + p)) break;
     try {
-      let imgs = await renderPageImgs(group, { dpi: DPI, crop: { x: 0, y: 0, w: bandW, h: bandH } });
-      // 裁图缺页/尺寸异常 → 整组退回低清整页（转录顶部标题仍可行），绝不因一组拖垮全局
-      if (imgs.length !== group.length) {
-        pushLog('⚠️ 标题带 P' + group[0] + ' 起渲染 ' + imgs.length + '/' + group.length + '，退回整页低清转录');
-        imgs = await renderPageImgs(group, { dpi: 110, forceWhole: true });
-      }
-      if (imgs.length !== group.length) continue;   // 仍不齐则跳过本组（错位转录比不转录更糟）
+      let imgs = await renderPageImgs([p], { dpi: DPI, crop: { x: 0, y: 0, w: bandW, h: bandH } });
+      if (!imgs.length) imgs = await renderPageImgs([p], { dpi: 110, forceWhole: true });   // 裁图失败退整页
+      if (!imgs.length) continue;
       const r = await aiJson(
-        [{ role: 'system', content: '你是标题转录机。给出的是同一份 PDF 连续若干页各自的【顶部横条截图】（按页码顺序）。逐页转录横条上的标题大字行原文；没有明显标题就写空串。只转录，不判断、不翻译、不改写。'
-          + '只输出 JSON：{"pages":[{"p":页码,"title":"顶部标题原文(≤40字)"}]}，每页一条、按给出顺序、一页不落。' },
-         { role: 'user', content: [{ type: 'text', text: '页码依次为：' + group.join('、') + '（共 ' + imgs.length + ' 张横条图，与页码一一对应）。逐页转录。' }].concat(imgs.map(u => ({ type: 'image_url', image_url: { url: u } }))) }],
-        { think: false, temperature: 0, maxTokens: 1200 });
-      const rows = Array.isArray(r && r.pages) ? r.pages : [];
-      rows.forEach(function (s) { const sp = parseInt(s && s.p, 10); if (sp >= group[0] && sp <= group[group.length - 1]) titles[sp] = String((s && s.title) || '').trim().slice(0, 40); });
-    } catch (e) { pushLog('⚠️ 标题带定界 P' + group[0] + ' 组失败（' + String((e && e.message) || e).slice(0, 80) + '），继续其余组', 'warn'); }
+        [{ role: 'system', content: '给你一页 PDF 的【顶部横条截图】。转录横条上的大字标题行原文（通常形如「XXX模拟试卷二」「第3套」）；横条上没有明显标题就输出空串。只转录，不判断、不翻译、不编造——看不清也输出空串。'
+          + '只输出 JSON：{"title":"…"}。' },
+         { role: 'user', content: [{ type: 'text', text: '请转录这页顶部横条的标题。' }, { type: 'image_url', image_url: { url: imgs[0] } }] }],
+        { think: false, temperature: 0, maxTokens: 200 });
+      titles[p] = String((r && r.title) || '').trim().slice(0, 40);
+    } catch (e) { pushLog('⚠️ 标题带转录 P' + p + ' 失败（' + String((e && e.message) || e).slice(0, 60) + '），跳过该页', 'warn'); }
   }
-  const dbg = Object.keys(titles).slice(0, 3).map(k => 'P' + k + ':' + (titles[k] || '∅'));
+  const dbg = Object.keys(titles).slice(0, 4).map(k => 'P' + k + ':' + (titles[k] || '∅'));
   pushLog('🧩 标题带转录样本：' + (dbg.join(' / ') || '无'));
   const starts = [];
   let lastNo = null, lastPage = 0;
@@ -1535,7 +1542,11 @@ async function detectSetsByTitleBand(deps) {
 async function detectSetsByGrid(deps) {
   const { pages, renderPageImgs, aiJson, budgetOk } = deps;
   const found = (deps.extraStarts || []).slice();   // 【v33】标题带定界的确定性结果并入候选（S2 统一高清确认）
-  for (let i = 1; i <= pages; i += 6) {
+  // 【v35】标题带已找到 ≥2 套首（带编号标题的常见形态）→ 确定性结果够用，跳过整页分类：
+  // 省 5+ 次请求与一分钟以上墙钟时间（弱供应商单次 30-120s），只在标题不带编号的书上才需要分类兜底。
+  if (found.length >= 2) {
+    pushLog('🧩 标题带已给出 ' + found.length + ' 个套首，跳过整页分类（省时省 token）');
+  } else for (let i = 1; i <= pages; i += 6) {
     const group = []; for (let p = i; p < Math.min(i + 6, pages + 1); p++) group.push(p);
     if (budgetOk && !budgetOk('宫格定界 P' + group[0] + '-' + group[group.length - 1])) break;
     try {
@@ -2257,7 +2268,7 @@ async function runImport(gist, job, prefs) {
                 id: 'bq' + ci + '_' + tag + qi,
                 num: n >= 1 && n <= 80 ? n : undefined,
                 stem: stem,
-                options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => cleanCtl(o).slice(0, 120)) : undefined,
+                options: Array.isArray(q.options) ? q.options.slice(0, 4).map(o => cleanCtl(o).slice(0, 240)) : undefined,   // v36：120→240，长公式选项不再被截断
                 answer: cleanCtl((q && q.answer)).trim().slice(0, 200),
                 solution: cleanCtl((q && q.solution)).trim().slice(0, 800),
                 conf: cf >= 0 && cf <= 1 ? Math.round(cf * 100) / 100 : undefined,
@@ -2370,6 +2381,16 @@ async function runImport(gist, job, prefs) {
           structSrc: structSrc, is2up: !!(RENDER_2UP && RENDER_2UP.pageW > RENDER_2UP.pageH * 1.1),
           basedOnPages: pages, builtBy: 'book-import', generatedAt: new Date().toISOString()
         };
+        // 【v36 选项审计】答案=单个 A-D 字母却无 options → 选择题选项丢失（用户实测：库里选择题
+        // 只存题干、复习无法作答）。日志如实报数并给处理建议（重发一次多半可修复，坏页可拍照补录）。
+        try {
+          var missOpt = 0, totOpt = 0;
+          out.forEach(function (ch) { (ch.questions || []).forEach(function (q) {
+            totOpt++;
+            if (/^\s*[A-Da-d]\s*$/.test(String(q.answer || '')) && !(Array.isArray(q.options) && q.options.length >= 2)) missOpt++;
+          }); });
+          if (missOpt) pushLog('⚠️ 选项审计：' + missOpt + '/' + totOpt + ' 题疑似选择题但选项缺失（模型偷懒漏写）——重发一次任务多半可补齐；仍缺的页可拍照单独补录', 'warn');
+        } catch (e) { }
         pushLog('✅ 整本提取完成：' + out.length + ' 章 · ' + qTotal + ' 题 · 视觉调用 ' + BOOK_VLM + '/' + BOOK_BUDGET + (repairedN ? '（含审计补提 ' + repairedN + ' 题）' : '') + (groups.length > 1 || groups[0].title !== '全册' ? '（' + groups.length + ' 个大类：' + groups.map(g => g.title + ' ' + g.count + ' 章').join(' / ') + '）' : ''));
         dropPendingStatus();
         await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
