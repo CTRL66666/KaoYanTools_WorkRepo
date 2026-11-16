@@ -9,6 +9,15 @@
  *   AI_ENDPOINT  OpenAI 兼容接口地址（如 https://api.xxx.com/v1）
  *   AI_KEY       接口密钥
  *   AI_MODEL     模型名
+ * ── v37（2026-11-11）────────────────────────────────────────
+ *   ① 逐题质量闸门 qcIssues（纯代码零 token）：选项正文重复 / 与卷内另一题自我复制 /
+ *      花括号不平衡 —— v36 的 validateQuestion 只看"结构齐不齐"，这三类"看起来合格、
+ *      做起来是废题"的问题它抓不到。判出来的题进同一张待重写清单（复用 2 轮收敛）。
+ *   ② 客户端指令通道 cmd.json：本地任务面板对运行中的云端任务点「定向重写」→
+ *      写指令进 Gist → 执行器在审查/重写阶段读一次并回执（done/failed）。
+ *      只做 rewrite 一种指令（删/加题会动分值对齐与蓝本槽位，v38 再谈）。
+ *   ③ 可测性：IIFE 改成具名 main + `require.main === module` 守卫，导出纯函数；
+ *      `require()` 本文件不再自己跑出卷、也不再因为缺 secrets 直接 exit。
  * 设计原则：任何阶段失败 → status.json 标 error + 原因；绝不把半成品标 done。
  *           用户在本地取消（status=canceled）→ 阶段边界检测到即退出。
  * ============================================================ */
@@ -142,9 +151,11 @@ async function readSourceBuffer(files, tag) {
 // v36 = 选项铁律（用户实测：库里的选择题只存题干、选项全丢，AI 只好说"给结论+理由不用圈选项"）：
 //       书提取提示词强制选择题输出全部 4 个选项；保存侧选项截断 120→240 字；收尾选项审计
 //       （答案=单字母但无 options 的题计数告警并给重发/补录建议）。
-const RUNNER_VER = 'v36';
+const RUNNER_VER = 'v37';
 
-if (!GIST_ID || !GH_TOKEN) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
+/* 只在**直接运行**时校验环境：单测 require 本文件是为了拿纯函数（qcIssues 等），
+ * 不该因为没配 secrets 就 process.exit —— 那会让"能被单测覆盖"这件事直接不成立。 */
+if (require.main === module && (!GIST_ID || !GH_TOKEN)) { console.error('缺 GIST_ID 或 GH_TOKEN'); process.exit(1); }
 
 function log(...a) { console.log('[runner]', ...a); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -262,6 +273,8 @@ async function writeLogFile(extra, jobId) {
 // ---------- 逐题状态跟踪（写进 status.json.qs，前端浮窗渲染逐题卡片墙） ----------
 // st: wait=排队中 / run=出题中 / done=完成 / fail=生成失败 / rewrite=重写中
 const QS = [];
+/** 【v37】质检/指令的计数（进 status.json，客户端与任务面板直接显示） */
+const QCSTAT = { warn: 0, cmdApplied: 0, cmdFailed: 0, cmdPending: 0 };
 // 已出合格题目（用于「停止并保存」——取消时把已完成的题攒成 partial 卷）
 let SAVED = [];
 
@@ -334,6 +347,52 @@ function readPartialJson(gist) {
   } catch (e) { log('!! partial.json 解析失败：', e.message); return null; }
 }
 
+/* ══════════ 【v37】客户端指令通道（cmd.json）══════════
+ *
+ * 用户在本地「任务详情」面板里对**云端任务**的某道题点「定向重写」→ 客户端把指令写进任务
+ * Gist 的 cmd.json（信箱）→ 执行器在「审查/重写」阶段读一次，把该题并进既有的定向重写池。
+ *
+ * 为什么只在这个阶段读一次：
+ *   · Actions 与本地没有直连通道，Gist 是唯一信箱，多读一次就多花一次配额；
+ *   · 复用既有重写池 = 复用它的 2 轮收敛（不达标带着失败原因再重写一次），
+ *     自己不另写一套"重写 AI 调用"，否则两条路的质量口径必然分叉；
+ *   · 指令到达时若已过该阶段，客户端会如实提示"本任务已进终检，请收卷后在题卷页修改"，
+ *     而不是假装排队成功。
+ *
+ * 只做「重写」一种指令：删除/加题会动分值对齐与蓝本槽位，属于另一件事（v38 再谈）。
+ */
+const CMD_FILE = 'cmd.json';
+async function readCmdFile() {
+  try {
+    const data = await ghRetry('GET', '/gists/' + GIST_ID, null, 2);
+    const txt = await gistFileText(data && data.files, CMD_FILE);
+    if (!txt) return { items: [] };
+    const o = JSON.parse(txt);
+    return { items: Array.isArray(o && o.items) ? o.items : [] };
+  } catch (e) {
+    log('!! 读取 cmd.json 失败（不影响出卷）：', e && e.message);
+    return { items: [] };
+  }
+}
+async function writeCmdFile(doc) {
+  try {
+    await ghRetry('PATCH', '/gists/' + GIST_ID, { files: { [CMD_FILE]: { content: JSON.stringify(doc) } } }, 2);
+    return true;
+  } catch (e) {
+    log('!! 写回 cmd.json 失败（指令回执丢失，但题目已重写）：', e && e.message);
+    return false;
+  }
+}
+/** 待执行的重写指令（只认 pending 且有合法题号的） */
+function pendingRewrites(doc, total) {
+  const items = (doc && Array.isArray(doc.items)) ? doc.items : [];
+  return items.filter((it) => {
+    if (!it || it.type !== 'rewrite' || it.st !== 'pending') return false;
+    const i = parseInt(it.index, 10);
+    return i >= 1 && i <= total;
+  });
+}
+
 // setStatus 串行化：多 worker 并发完成时 PATCH 同一 gist 文件，链式排队避免互踩/乱序
 //
 // 【2026-09-03 配额救星·状态回写风暴治理】旧实现每次状态变更都全量 PATCH status.json
@@ -350,6 +409,18 @@ let _stChain = Promise.resolve();
 const _ST_THROTTLE_MS = 8000;
 let _stLast = { key: '', at: 0, stage: '' };
 let _stPending = null;   // { status, stage, msg, progress, timer }
+/* 【v37】status.json 的"回执"附加字段（qc 质检命中数 / cmd 本地指令回执）。
+ *
+ * 为什么要抽成函数：status.json 有 **8 处**直写点（节流写入 + 终止/取消/完成/导入/自检…），
+ * 之前只在节流写入那一处加了 qc/cmd —— 后果是任务**跑完那一刻**回执就凭空消失：
+ * 用户在面板里看着「已重写 1 条」，任务一 done 那行就没了，像被撤销了一样。
+ * 现在所有写入点都展开这个对象，口径只有一份。 */
+function statusExtra() {
+  return {
+    qc: { warn: QCSTAT.warn },
+    cmd: { applied: QCSTAT.cmdApplied, failed: QCSTAT.cmdFailed, pending: QCSTAT.cmdPending },
+  };
+}
 function _stKey(status, stage, msg, progress) { return [status, stage, msg, progress].join('|'); }
 function setStatus(status, stage, msg, progress, force) {
   const key = _stKey(status, stage, msg, progress);
@@ -392,7 +463,7 @@ async function _setStatus(status, stage, msg, progress) {
   pushLog((stage ? '[' + stage + '] ' : '') + (msg || ''));
   // savedCount = 已成功落盘到 partial.json 的题数（= 客户端随时能抢救走的数量），
   // 让本地无需额外拉 Gist 就知道「现在有几题可抢救」，任务行可直接显示入口。
-  const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) } } };
+  const payload = { files: { 'status.json': { content: JSON.stringify({ status, stage: stage || '', msg: msg || '', progress: progress == null ? null : progress, log: RUN_LOG, qs: QS, savedCount: _partialCount, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) } } };
   try { await ghRetry('PATCH', '/gists/' + GIST_ID, payload); _stLast = { key: _stKey(status, stage, msg, progress), at: Date.now(), stage: stage }; log('status →', status, stage || '', msg || ''); return true; }
   catch (e) {
     const hint = (e && e.status === 404)
@@ -1115,6 +1186,66 @@ function validateQuestion(q) {
   if (solLen < minLen) return '解析不完整（' + solLen + ' 字 < ' + minLen + ' 字下限，需分步推导+结论+易错点）';
   return '';
 }
+/* ══════════ 【v37】逐题质量闸门（纯代码，零 token） ══════════
+ *
+ * 为什么加：v36 的 validateQuestion 只看"结构齐不齐"（题干/答案/选项个数/答案在不在选项里），
+ * 但有三类**看起来合格、做起来是废题**的问题它抓不到：
+ *   ① 四个选项里有两条内容一模一样（学生怎么选都有一半概率对，题就废了）；
+ *   ② 同一份卷子里两道题题干几乎一样（AI 并发出题时经常自我复制，尤其同一考点 4 路并发）；
+ *   ③ 解析里 LaTeX 花括号不平衡（渲染出来一片红字）。
+ * 这三条都能纯代码判，判出来的题直接进既有的「定向重写池」修（那条链路本来就有 2 轮收敛）。
+ */
+function stripOptPrefix(o) {
+  /* 去前缀 + 去 LaTeX 轻标记：`A. $2$` 与 `B. 2` 在**内容上是同一个选项**，
+   * 只去前缀会把它们当两条不同的选项（漏判重复）。这里把 $ \left \right \, 空格一并抹掉。 */
+  return String(o == null ? '' : o)
+    .replace(/^\s*[（(]?[A-Da-d1-4]\s*[)）．.、:：,，]?\s*/, '')
+    .replace(/\\(?:left|right|displaystyle|textstyle)/g, '')
+    .replace(/\\[,;:!]/g, '')
+    .replace(/[$\s\u3000]/g, '')
+    .trim();
+}
+/** 文本二元组相似度（中文没有空格分词，取双向覆盖率均值，与站内 U.sim 同口径） */
+function bigramSim(a, b) {
+  const norm = (x) => String(x == null ? '' : x).replace(/[\s\u3000]+/g, '').replace(/[、，,。.：:；;·\-—_/\\|"「」《》【】（）()\[\]]/g, '').toLowerCase();
+  const ta = norm(a), tb = norm(b);
+  if (!ta || !tb) return 0;
+  const ga = {}, gb = {};
+  let na = 0, nb = 0, hit = 0;
+  for (let i = 0; i < ta.length - 1; i++) { const k = ta.substr(i, 2); if (!ga[k]) { ga[k] = 1; na++; } }
+  for (let i = 0; i < tb.length - 1; i++) { const k = tb.substr(i, 2); if (!gb[k]) { gb[k] = 1; nb++; } }
+  if (!na || !nb) return 0;
+  for (const k in ga) if (gb[k]) hit++;
+  return (hit / na + hit / nb) / 2;
+}
+/** 一题的质检问题（空数组 = 通过） */
+function qcIssues(q, peers) {
+  const out = [];
+  if (!q || typeof q !== 'object') return ['不是对象'];
+  // ① 选项正文重复（前缀不同也算重复：A. 1 / B. 1）
+  if (q.type === 'choice' && Array.isArray(q.options)) {
+    const bodies = q.options.map(stripOptPrefix);
+    const seen = {};
+    bodies.forEach((b, i) => {
+      if (!b) { out.push('第' + (i + 1) + '个选项正文为空'); return; }
+      if (seen[b] != null) out.push('选项内容重复：「' + b.slice(0, 16) + '」同时出现在第' + (seen[b] + 1) + '、' + (i + 1) + '项');
+      else seen[b] = i;
+    });
+  }
+  // ② 与卷内其它题雷同（≥0.82 视为自我复制；阈值取高，避免"同考点正常相似"误伤）
+  const peers2 = (peers || []).filter((x) => x && x !== q && x.stem);
+  let worst = 0;
+  peers2.forEach((x) => {
+    const sim = bigramSim(q.stem, x.stem);
+    if (sim > worst) worst = sim;
+  });
+  if (worst >= 0.82) out.push('与卷内另一题高度雷同（相似度 ' + Math.round(worst * 100) + '%）');
+  // ③ 花括号平衡（题干与解析）
+  if (!braceBalanced(q.stem)) out.push('题干 LaTeX 花括号不平衡');
+  if (!braceBalanced(q.solution)) out.push('解析 LaTeX 花括号不平衡');
+  return out;
+}
+
 // LaTeX 花括号平衡粗检（防 AI 漏花括号导致渲染崩坏）
 function braceBalanced(s) {
   let n = 0;
@@ -1141,7 +1272,7 @@ async function handleTermination(sig) {
   dropPendingStatus();   // 丢弃节流攒着的待发 running，避免 8s 后迟到 PATCH 覆盖下面的 error 终态
   // 被杀的宽限期只有几秒：直写不走 ghRetry（限额长退避会白等几分钟，等来 SIGKILL）
   const payload = { files: {
-    'status.json': { content: JSON.stringify({ status: 'error', stage: '', msg: '⚠ 执行器被强制终止（' + sig + '：Actions 超时或手动取消）· 已出 ' + _partialCount + ' 题已落盘 partial.json，可点「🆘 抢救已出题目」收卷', progress: null, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
+    'status.json': { content: JSON.stringify({ status: 'error', stage: '', msg: '⚠ 执行器被强制终止（' + sig + '：Actions 超时或手动取消）· 已出 ' + _partialCount + ' 题已落盘 partial.json，可点「🆘 抢救已出题目」收卷', progress: null, log: RUN_LOG, qs: QS, savedCount: _partialCount, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
   } };
   for (let i = 0; i < 2; i++) {
     try { await ghReq('PATCH', '/gists/' + GIST_ID, payload); log('✅ 终态已回写'); break; }
@@ -1301,7 +1432,7 @@ function normalizeImported(q, g) {
  * schema 强制 num（原题号），规约要求题号连续覆盖——审计函数据此找缺口，缺则定向补提。 */
 const BOOK_Q_COMPLETE_RULE = '【完整性铁律——最重要】必须输出本章全部题目，一题不落：'
   + '每题的 num 填原文题号（数字），输出前自查题号是否从最小号连续覆盖到最大号；'
-  + '题干再长、解析再繁也不许省略或概括——宁可 solution 写简，不可丢题。原文没有的题号不许编造。'
+  + '题干再长、解析再繁也不许省略或概括——宁可 solution 留空，不可丢题。原文没有的题号不许编造。【解析禁令·2026-10-31】不要为题目编写或补全解析：原文有解析就照抄，原文没有就把 solution 写成空字符串 ""。解析由站内后续本地生成，云端"提取 + 顺手解题"的正确率太低（用户实测），两边都做反而都不准。'
   + '【选项铁律】选择题必须输出【全部选项】options（每题 4 项，每项以 "A. "…开头、含该项完整文本），'
   + '一项不许少、不许只给首项、不许概括写成"见原文"；选项里的公式照常用 $…$ LaTeX 还原。'
   + '填空题/解答题没有选项才省略 options。缺选项的选择题会被系统判为提取失败——'
@@ -1313,7 +1444,7 @@ function bookChapterSystem(subject, kind) {
   const kn = kind === '习题册' ? '习题册' : '讲义';
   return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文（文字层提取，可能有排版噪声）。'
     + '请产出本章的结构化学习内容，只输出 JSON（不要 markdown 围栏）：'
-    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"num":原题号数字,"stem":"题目原文(不重复题号前缀)","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码}]}。'
+    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"num":原题号数字,"stem":"题目原文(不重复题号前缀)","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"原文解析（没有就空串，禁止自行编写）","page":原文页码}]}。'
     + '要求：1) content 提炼本章真正的知识内容（定义/定理/方法/结论/例题讲解），每段≤300字，按原文顺序，公式用 $…$ LaTeX；'
     + '2) questions 提取原文中出现的例题与习题，没有题目就给空数组；3) 忠实原文，禁止编造原文没有的内容；4) 用简体中文。'
     + BOOK_Q_COMPLETE_RULE;
@@ -1323,7 +1454,7 @@ function bookChapterVisionSystem(subject, kind) {
   const kn = kind === '习题册' ? '习题册' : '讲义';
   return '你是考研资料数字化专家。下面是一本' + subject + kn + '中某一章的原文页面图片（公式密集，文字层不可靠，故走整页视觉识别）。'
     + '请产出本章的结构化学习内容，只输出 JSON（不要 markdown 围栏）：'
-    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"num":原题号数字,"stem":"题目原文(不重复题号前缀)","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"解析（含步骤）","page":原文页码,"confidence":0.0到1.0}]}。'
+    + '{"content":["讲义要点段落1","段落2",…],"questions":[{"num":原题号数字,"stem":"题目原文(不重复题号前缀)","options":["A. ..","B. .."]或省略,"answer":"答案","solution":"原文解析（没有就空串，禁止自行编写）","page":原文页码,"confidence":0.0到1.0}]}。'
     + '【双通道校对】若消息附带该页文字层：以图片理解版面/题号/公式结构，文字层仅用于校对汉字与数字；'
     + '冲突时公式一律以图片为准、汉字以文字层为准；文字层大面积乱码时忽略它。'
     + '【图形题】题干含函数图像/几何图时照常提取文字部分，confidence 酌情下调。'
@@ -1355,7 +1486,7 @@ function auditGapNums(questions) {
 function bookRepairSystem(chTitle, missList) {
   return '你是考研资料数字化专家。《' + chTitle + '》此前已提取过题目，但缺以下题号：' + missList.join('、') + '。'
     + '请在原文（文字或图片）中只找这些题号的题目，逐字转录。只输出 JSON：'
-    + '{"questions":[{"num":题号,"stem":"题干全文(公式用$…$LaTeX)","options":["A. ..",…]或省略,"answer":"答案","solution":"解析"}]}。'
+    + '{"questions":[{"num":题号,"stem":"题干全文(公式用$…$LaTeX)","options":["A. ..",…]或省略,"answer":"答案","solution":"原文解析（没有就空串，禁止自行编写）"}]}。'
     + '原文确实没有的题号（跳号、只有答案没有题目、或属于下一套卷）就跳过，严禁编造。找不到任何缺失题就输出 {"questions":[]}。';
 }
 
@@ -2395,7 +2526,7 @@ async function runImport(gist, job, prefs) {
         dropPendingStatus();
         await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
           'result.json': { content: JSON.stringify({ builtBy: 'book-import', book: book }) },
-          'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📚 整本提取完成（' + out.length + ' 章 · ' + qTotal + ' 题），可收录到资料库', progress: 100, log: RUN_LOG, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER, isBook: true }) }
+          'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📚 整本提取完成（' + out.length + ' 章 · ' + qTotal + ' 题），可收录到资料库', progress: 100, log: RUN_LOG, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER, isBook: true }) }
         } });
         log('✅ 资料库任务完成');
         return;
@@ -2535,7 +2666,7 @@ async function runImport(gist, job, prefs) {
     dropPendingStatus();
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
       'result.json': { content: JSON.stringify(exam) },
-      'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📄 识别完成（' + uniq.length + ' 题 · 待复核 ' + lowN + '），可收卷导入预览确认', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, imported: true, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
+      'status.json': { content: JSON.stringify({ status: 'done', stage: 'finalizing', msg: '📄 识别完成（' + uniq.length + ' 题 · 待复核 ' + lowN + '），可收卷导入预览确认', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, imported: true, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
     } });
     log('✅ 导入任务完成');
   } finally {
@@ -2544,7 +2675,7 @@ async function runImport(gist, job, prefs) {
 }
 
 // ---------- 主流程 ----------
-(async function main() {
+async function main() {
   // 供 catch（取消/失败路径）使用：try 块内 let/const 的作用域到不了 catch，
   // 若在 catch 里直接引用 gist/subj 会 ReferenceError 崩进程 → partial 卷写不出去。
   let JOB_GIST = null;
@@ -2616,7 +2747,7 @@ async function runImport(gist, job, prefs) {
     if (prefs.check) {const aiOk = !!(aiConf('endpoint') && aiConf('key') && aiConf('model'));
       await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
         'result.json': { content: JSON.stringify({ cloudJobCheck: true, ok: true, aiConfigPresent: aiOk, checkedAt: new Date().toISOString() }) },
-        'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '🧪 自检通过：Gist 读写 ✓ · CLOUDJOB_GH_TOKEN ✓ · AI 配置在场' + (aiOk ? ' ✓' : ' ✗'), progress: 100, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
+        'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '🧪 自检通过：Gist 读写 ✓ · CLOUDJOB_GH_TOKEN ✓ · AI 配置在场' + (aiOk ? ' ✓' : ' ✗'), progress: 100, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
       } });
       log('🧪 自检完成');
       return;
@@ -2810,13 +2941,49 @@ async function runImport(gist, job, prefs) {
 
     // ④ 蓝本硬校验（纯代码）：坏题先标记，交由审查后统一重写
     const localIssues = [];
+    let qcWarn = 0;
     questions.forEach((q, i) => {
       const bad = validateQuestion(q);
       const braceBad = !braceBalanced(q.stem) || !braceBalanced(q.solution);
-      if (bad || braceBad) localIssues.push({ index: i + 1, reason: bad + (braceBad ? '；LaTeX 花括号不平衡' : ''), fixHint: '修复结构问题，保持题意不变' });
+      /* 【v37 逐题质量闸门】结构合格 ≠ 题能用：选项内容重复 / 与卷内另一题自我复制 /
+       * 花括号不平衡。这三条纯代码可判，判出来直接进下面同一张待修清单（复用 2 轮收敛）。 */
+      const qc = qcIssues(q, questions);
+      if (qc.length) qcWarn++;
+      if (bad || braceBad || qc.length) {
+        const reasons = [bad, braceBad ? 'LaTeX 花括号不平衡' : ''].concat(qc).filter(Boolean);
+        localIssues.push({ index: i + 1, reason: reasons.join('；'), fixHint: '修复结构/选项/重复问题，保持题意不变' });
+      }
     });
-    log('本地硬校验：', localIssues.length, '题有问题');
-    pushLog('🔍 本地硬校验：' + (questions.length - localIssues.length) + ' 题过关，' + localIssues.length + ' 题待修');
+    QCSTAT.warn = qcWarn;
+    /* 【v37 预算保护】质检是"锦上添花"，不能把整卷拖进重写池：一卷 20 题、每题重写要 30~90s，
+     * 要是模型这一卷出得都很模板化（生成题跟生成题互相像），20 题全重写会把 Actions 时限烧穿，
+     * 结果**一道题都交付不了**——比"有几道雷同题"糟得多。
+     * 所以：质检命中的题按"严重度"排序，只取前 40% 进池；超出的如实记日志（不静默）。
+     * 结构不合格（validateQuestion 挂）的题不受此限——那种是废题，必须修。 */
+    const QC_BUDGET = Math.max(2, Math.ceil(questions.length * 0.4));
+    const qcOnly = localIssues.filter((it) => {
+      const q = questions[it.index - 1];
+      return q && !validateQuestion(q);   // 结构本身没问题的，才属于"质检命中"
+    });
+    if (qcOnly.length > QC_BUDGET) {
+      const dropped = qcOnly.slice(QC_BUDGET);
+      const keepSet = new Set(qcOnly.slice(0, QC_BUDGET).map((it) => it.index));
+      const trimmed = localIssues.filter((it) => {
+        const q = questions[it.index - 1];
+        if (q && !validateQuestion(q)) return keepSet.has(it.index);   // 质检项按预算保留
+        return true;                                                  // 结构项全留
+      });
+      const removed = localIssues.length - trimmed.length;
+      localIssues.length = 0;
+      trimmed.forEach((x) => localIssues.push(x));
+      pushLog('⚖️ 质检命中 ' + qcOnly.length + ' 题，超出重写预算（' + QC_BUDGET + '）→ 本轮只修最前面的 '
+        + QC_BUDGET + ' 题，其余 ' + removed + ' 题如实留档（' + dropped.slice(0, 3).map((x) => '第' + x.index + '题').join('、') + '…）', 'warn');
+      qcWarn = QC_BUDGET;
+      QCSTAT.warn = QC_BUDGET;
+    }
+    log('本地硬校验：', localIssues.length, '题有问题（其中质检命中 ' + qcWarn + ' 题）');
+    pushLog('🔍 本地硬校验：' + (questions.length - localIssues.length) + ' 题过关，' + localIssues.length + ' 题待修'
+      + (qcWarn ? '（含质检：选项重复/自我复制/公式残破 ' + qcWarn + ' 题）' : ''));
 
     // ⑤ 总工审查
     await setStatus('running', 'reviewing', '总工程师审查中…', 58);
@@ -2847,6 +3014,27 @@ async function runImport(gist, job, prefs) {
       if (!seenRw[idx]) { seenRw[idx] = 1; rewriteList.push(r); }
     });
     localIssues.forEach(li => { if (!seenRw[li.index]) { seenRw[li.index] = 1; rewriteList.push(li); } });
+    /* 【v37 客户端指令】用户在本地任务面板点名的题，并进同一张待重写清单
+     * （复用重写池的 2 轮收敛，不另写一套重写调用）。读一次 Gist，配额只多 1 次。 */
+    let cmdDoc = { items: [] };
+    let cmdApplied = 0, cmdFailed = 0;
+    try {
+      cmdDoc = await readCmdFile();
+      const want = pendingRewrites(cmdDoc, questions.length);
+      QCSTAT.cmdPending = (cmdDoc.items || []).filter(x => x && x.st === 'pending').length;
+      if (want.length) {
+        await setStatus('running', 'reviewing', '收到本地重写指令 ' + want.length + ' 条…', 60, true);
+        want.forEach((it) => {
+          const idx = parseInt(it.index, 10);
+          it.st = 'running';
+          const exist = rewriteList.find(r => r.index === idx);
+          if (exist) { if (!exist.cmdId) exist.cmdId = it.id; }
+          else { seenRw[idx] = 1; rewriteList.push({ index: idx, reason: '用户在本地点名重写这一题', fixHint: String(it.hint || '').slice(0, 120), cmdId: it.id }); }
+          pushLog('📝 本地指令：第' + idx + '题定向重写' + (it.hint ? '（' + String(it.hint).slice(0, 30) + '）' : ''));
+        });
+        cmdApplied = want.length;
+      }
+    } catch (e) { log('!! 指令通道异常（不影响出卷）：', e && e.message); }
     log('审查 verdict=', review.verdict || 'n/a', '待重写', rewriteList.length, '题');
     pushLog('🧐 总审查 verdict=' + (review.verdict || 'n/a') + (review.summary ? '（' + String(review.summary).slice(0, 60) + '）' : '') + '，待重写 ' + rewriteList.length + ' 题');
     rewriteList.forEach(rw => pushLog('　第' + rw.index + '题需重写：' + String(rw.reason || '').slice(0, 50)));
@@ -2888,10 +3076,33 @@ async function runImport(gist, job, prefs) {
         }
         if (!fixed) { log('重写 2 轮后仍不合格，保留原题 @', rw.index, lastBad); pushLog('⚠️ 第' + rw.index + '题重写 2 轮仍未过关，保留原题（' + String(lastBad || '').slice(0, 40) + '）'); const q = QS[i]; if (q) { q.st = 'done'; q.err = '重写未过，保留原题'; } return null; }
         questions[i] = fixed;
-        const q = QS[i]; if (q) { q.st = 'done'; q.stem = String(fixed.stem || '').slice(0, 140); q.ans = String(fixed.answer || '').slice(0, 60); }
+        const q = QS[i]; if (q) { q.st = 'done'; q.err = ''; q.stem = String(fixed.stem || '').slice(0, 140); q.ans = String(fixed.answer || '').slice(0, 60); }
         pushLog('✏️ 第' + rw.index + '题重写完成');
         return null;
       }, (d, n) => setStatus('running', 'rewriting', '定向重写中… ' + d + '/' + n, 68 + Math.round(d / n * 20)));
+    }
+
+    /* 【v37】指令回执：把每条指令的最终状态写回 cmd.json ——
+     * 客户端据此把那一行从「重写中」改成「已重写 / 未通过」，而不是永远转圈。 */
+    if (cmdDoc && Array.isArray(cmdDoc.items) && cmdDoc.items.length) {
+      cmdDoc.items.forEach((it) => {
+        if (it.st !== 'running') return;
+        const q = QS[parseInt(it.index, 10) - 1];
+        const bad = q && q.err ? String(q.err) : '';
+        it.st = bad ? 'failed' : 'done';
+        it.result = bad ? bad : '已重写';
+        it.at = new Date().toISOString();
+        if (bad) cmdFailed++;
+      });
+      cmdDoc.runnerVer = RUNNER_VER;
+      cmdDoc.updatedAt = new Date().toISOString();
+      await writeCmdFile(cmdDoc);
+      QCSTAT.cmdFailed = cmdFailed;
+      QCSTAT.cmdApplied = Math.max(0, cmdApplied - cmdFailed);
+      /* pending 必须在**消费后**归零：读到指令时记的是"这一批有几条"，处理完还挂在那里就会
+       * 让任务结束后仍显示「排队 1」，用户以为还有一条没生效（实际早跑完了）。 */
+      QCSTAT.cmdPending = 0;
+      pushLog('📩 本地指令回执：已重写 ' + QCSTAT.cmdApplied + ' 条' + (cmdFailed ? '，未通过 ' + cmdFailed + ' 条' : ''));
     }
 
     // ⑦ 终检 + 打包
@@ -2946,7 +3157,7 @@ async function runImport(gist, job, prefs) {
     dropPendingStatus();
     await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
       'result.json': { content: JSON.stringify(exam) },
-      'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
+      'status.json': { content: JSON.stringify({ status: 'done', stage: '', msg: '出卷完成（' + questions.length + ' 题 · ' + totalScore + ' 分），可收卷导入', progress: 100, log: RUN_LOG, qs: QS, savedCount: _partialCount, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
     } });
     log('✅ 完成');
   } catch (e) {
@@ -2974,7 +3185,7 @@ async function runImport(gist, job, prefs) {
           };
           await ghRetry('PATCH', '/gists/' + GIST_ID, { files: {
             'result.json': { content: JSON.stringify(partial) },
-            'status.json': { content: JSON.stringify({ status: 'canceled', stage: '', msg: '⏹ 已停止 · 已保存 ' + cands.length + ' 题（可收卷导入部分卷）', progress: 100, partialSaved: true, partialCount: cands.length, savedCount: _partialCount, log: RUN_LOG, qs: QS, updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
+            'status.json': { content: JSON.stringify({ status: 'canceled', stage: '', msg: '⏹ 已停止 · 已保存 ' + cands.length + ' 题（可收卷导入部分卷）', progress: 100, partialSaved: true, partialCount: cands.length, savedCount: _partialCount, log: RUN_LOG, qs: QS, ...statusExtra(), updatedAt: new Date().toISOString(), runnerVer: RUNNER_VER }) }
           } });
           log('⏹ 已停止并保存', cands.length, '题');
         } else {
@@ -3004,4 +3215,23 @@ async function runImport(gist, job, prefs) {
     try { await setStatus('error', '', '云端执行失败：' + ((e && e.message) || e)); } catch (e2) {}
     process.exitCode = 1;
   }
-})();
+}
+
+/* 只有被直接运行时才执行主流程。
+ * 为什么改：v37 的逐题质检是**纯函数**，能被单测覆盖才有意义（否则只能靠人肉读代码）；
+ * 而 `require()` 一个会自己跑出卷的脚本 = 单测里直接发起真实请求。 */
+if (require.main === module) { main(); }
+
+module.exports = {
+  RUNNER_VER,
+  /* harness（tools/_runner_harness.cjs）需要显式调用（它靠 mock https 跑整条流水线）：
+   * 改成 require 即执行的话，单测就没法只要纯函数了。 */
+  main,
+  validateQuestion,
+  qcIssues,
+  bigramSim,
+  stripOptPrefix,
+  braceBalanced,
+  pendingRewrites,
+  CMD_FILE,
+};
